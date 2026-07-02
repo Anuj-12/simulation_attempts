@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ReCon Readiness Report</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 2rem; background: #0f172a; color: #e2e8f0; }
+  h1 { color: #38bdf8; }
+  .verdict { font-size: 1.4rem; padding: 1rem; border-radius: 8px; margin: 1rem 0; }
+  .ready { background: #14532d; border: 1px solid #22c55e; }
+  .not-ready { background: #450a0a; border: 1px solid #ef4444; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+  th, td { border: 1px solid #334155; padding: 0.5rem 0.75rem; text-align: left; }
+  th { background: #1e293b; }
+  tr.pass td:nth-child(2) { color: #4ade80; font-weight: bold; }
+  tr.fail td:nth-child(2) { color: #f87171; font-weight: bold; }
+  .meta { color: #94a3b8; }
+</style>
+</head>
+<body>
+<h1>ReCon HFL — System Readiness</h1>
+<p class="meta">Mode: recovery | Detector: flguardian | Malicious: u5</p>
+<div class="verdict ready">
+  ✓ SYSTEM READY — 5/5 checks passed
+</div>
+<h2>Readiness Checks</h2>
+<table><tr><th>Check</th><th>Status</th><th>Detail</th></tr><tr class="pass"><td>Round history captured</td><td>PASS</td><td>8 rounds logged</td></tr><tr class="pass"><td>FLGuardian flags malicious UAV (λ)</td><td>PASS</td><td>Malicious UAV λ exceeded benign minimum by >0.05 in at least one round</td></tr><tr class="pass"><td>PPO quarantine/exclude on threat</td><td>PASS</td><td>Malicious UAV received QUARANTINE or EXCLUDE</td></tr><tr class="pass"><td>Global model trains</td><td>PASS</td><td>Accuracy 0.6695 → 0.1000</td></tr><tr class="pass"><td>Recovery subsystem engaged</td><td>PASS</td><td>checkpoint t_c=0, max excluded=4</td></tr></table>
+<h2>Round Summary</h2>
+<table><tr><th>Round</th><th>Accuracy</th><th>Active</th><th>Quarantined</th><th>Excluded</th></tr><tr><td>1</td><td>0.6695</td><td>1</td><td>4</td><td>0</td></tr><tr><td>2</td><td>0.1000</td><td>2</td><td>2</td><td>1</td></tr><tr><td>3</td><td>0.1000</td><td>0</td><td>2</td><td>3</td></tr><tr><td>4</td><td>0.1000</td><td>0</td><td>2</td><td>3</td></tr><tr><td>5</td><td>0.1000</td><td>0</td><td>2</td><td>3</td></tr><tr><td>6</td><td>0.1000</td><td>0</td><td>1</td><td>4</td></tr><tr><td>7</td><td>0.1000</td><td>1</td><td>0</td><td>4</td></tr><tr><td>8</td><td>0.1000</td><td>1</td><td>0</td><td>4</td></tr></table>
+<h2>Final UAV State</h2>
+<table><tr><th>UAV</th><th>Coalition</th><th>λ</th><th>ρ</th><th>q</th><th>State</th><th>Action</th><th>Malicious</th></tr><tr><td>u1</td><td>c1</td><td>0.561</td><td>0.494</td><td>1</td><td>EXCLUDED</td><td>ALLOW</td><td>no</td></tr><tr><td>u2</td><td>c1</td><td>0.333</td><td>0.504</td><td>1</td><td>EXCLUDED</td><td>ALLOW</td><td>no</td></tr><tr><td>u3</td><td>c1</td><td>0.000</td><td>0.508</td><td>1</td><td>EXCLUDED</td><td>ALLOW</td><td>no</td></tr><tr><td>u4</td><td>c1</td><td>0.000</td><td>0.544</td><td>2</td><td>ACTIVE</td><td>ALLOW</td><td>no</td></tr><tr><td>u5</td><td>c1</td><td>0.000</td><td>0.482</td><td>2</td><td>EXCLUDED</td><td>ALLOW</td><td>yes</td></tr></table>
+</body>
+</html>

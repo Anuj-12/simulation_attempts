@@ -1,0 +1,45 @@
+========================================================================
+ReCon HFL — SYSTEM READINESS REPORT
+========================================================================
+Generated : 2026-07-02T14:51:42
+Mode      : recovery
+Detector  : flguardian (φ)
+Malicious : u5
+Verdict   : READY (5/5 checks passed)
+
+READINESS CHECKS
+------------------------------------------------------------------------
+  [PASS] Round history captured
+         8 rounds logged
+  [PASS] FLGuardian flags malicious UAV (λ)
+         Malicious UAV λ exceeded benign minimum by >0.05 in at least one round
+  [PASS] PPO quarantine/exclude on threat
+         Malicious UAV received QUARANTINE or EXCLUDE
+  [PASS] Global model trains
+         Accuracy 0.4269 → 0.1000
+  [PASS] Recovery subsystem engaged
+         checkpoint t_c=0, max excluded=5
+
+ROUND SUMMARY
+------------------------------------------------------------------------
+ Rnd      Acc  Active   Q  Ex  Notable UAV actions
+------------------------------------------------------------------------
+   1   0.4269       5   0   0  u1:λ=0.74→ALL, u5:λ=1.00→ALL
+   2   0.1000       1   1   3  u1:λ=0.67→QUA, u3:λ=0.02→EXC, u4:λ=0.00→EXC, u5:λ=1.00→EXC
+   3   0.1775       1   1   3  u2:λ=0.01→QUA, u5:λ=1.00→ALL
+   4   0.4032       2   0   3  u5:λ=1.00→ALL
+   5   0.5843       2   0   3  u5:λ=1.00→ALL
+   6   0.6551       2   0   3  u5:λ=1.00→ALL
+   7   0.7011       2   0   3  u5:λ=1.00→ALL
+   8   0.1000       0   0   5  u1:λ=0.04→EXC, u2:λ=0.04→EXC, u5:λ=1.00→ALL
+
+PER-UAV FINAL STATE
+------------------------------------------------------------------------
+UAV    Coal       λ       ρ   q State        Action     Mal?
+------------------------------------------------------------------------
+u1     c1     0.036   0.522   1 EXCLUDED     EXCLUDE    no
+u2     c1     0.036   0.517   1 EXCLUDED     EXCLUDE    no
+u3     c1     0.020   0.501   0 EXCLUDED     ALLOW      no
+u4     c1     0.000   0.501   0 EXCLUDED     ALLOW      no
+u5     c1     1.000   0.495   0 EXCLUDED     ALLOW      yes
+========================================================================

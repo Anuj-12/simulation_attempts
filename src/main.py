@@ -18,8 +18,6 @@ ReCon pipeline (ReCon.tex):
 from __future__ import annotations
 
 import argparse
-import os
-from datetime import datetime
 from typing import List, Sequence, Tuple
 
 from flguardian_det import build_flguardian_hfl_adapter
@@ -36,11 +34,31 @@ from hfl_rl import (
 
 CoalitionSpec = Tuple[str, Sequence[str]]
 
-DEFAULT_COALITIONS: List[CoalitionSpec] = [
-    ("c1", ["u1", "u2", "u3", "u4", "u5"]),
-]
+def _build_default_coalitions(num_coalitions: int = 5, uavs_per_coalition: int = 10) -> List[CoalitionSpec]:
+    """c1..cN, each holding a contiguous block of u1..u(N*uavs_per_coalition).
 
-DEFAULT_MALICIOUS = ["u5"]
+    e.g. c1 = u1-u10, c2 = u11-u20, ... c5 = u41-u50.
+    """
+    coalitions: List[CoalitionSpec] = []
+    next_uav = 1
+    for c_idx in range(1, num_coalitions + 1):
+        members = [f"u{next_uav + i}" for i in range(uavs_per_coalition)]
+        next_uav += uavs_per_coalition
+        coalitions.append((f"c{c_idx}", members))
+    return coalitions
+
+
+DEFAULT_COALITIONS: List[CoalitionSpec] = _build_default_coalitions()
+
+# ~20% (10/50) malicious UAVs, 2 per coalition so every coalition (c1..c5)
+# contains at least one attacker.
+DEFAULT_MALICIOUS: List[str] = [
+    "u3", "u8",     # c1 (u1-u10)
+    "u13", "u18",   # c2 (u11-u20)
+    "u23", "u28",   # c3 (u21-u30)
+    "u33", "u38",   # c4 (u31-u40)
+    "u43", "u48",   # c5 (u41-u50)
+]
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,7 +85,8 @@ def parse_args() -> argparse.Namespace:
         "--malicious",
         nargs="*",
         default=DEFAULT_MALICIOUS,
-        help="Edge UAV ids simulated as model-poisoning attackers (default: u5)",
+        help="Edge UAV ids simulated as model-poisoning attackers "
+        "(default: 10 UAVs, ~20%%, 2 per coalition)",
     )
     parser.add_argument(
         "--poison-scale",
@@ -81,7 +100,7 @@ def parse_args() -> argparse.Namespace:
         default=2.0,
         help="κ_th: urgency score for checkpoint creation (default: 2.0)",
     )
-    parser.add_argument("--rounds", type=int, default=8, help="Number of FL rounds")
+    parser.add_argument("--rounds", type=int, default=100, help="Number of FL rounds")
     parser.add_argument("--local-epochs", type=int, default=1, help="Local epochs per round")
     parser.add_argument("--batch-size", type=int, default=64, help="Training batch size")
     parser.add_argument("--lr", type=float, default=0.01, help="Local SGD learning rate")
@@ -90,7 +109,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=str,
         default="./output",
-        help="Directory for readiness report files",
+        help="(unused - kept for CLI compatibility; results now print to terminal only)",
     )
     parser.add_argument(
         "--device",
@@ -118,11 +137,12 @@ def make_contamination_detector(args: argparse.Namespace):
     return build_flguardian_hfl_adapter(device=args.device)
 
 
-def run_base_mode(config: HFLConfig, coalitions: List[CoalitionSpec]) -> None:
+def run_base_mode(config: HFLConfig, coalitions: List[CoalitionSpec]):
     print("Running base HFL (no RL state management)")
     station = build_hfl_system(coalitions, config=config)
     _, test_set = load_fashion_mnist(config.data_dir)
     station.run(test_set)
+    return station
 
 
 def run_rl_mode(
@@ -171,205 +191,131 @@ def run_recovery_mode(
     return station
 
 
-def _readiness_checks(station, malicious_uavs: Sequence[str]) -> List[Tuple[str, bool, str]]:
-    """Evaluate whether core ReCon subsystems behaved as expected."""
-    checks: List[Tuple[str, bool, str]] = []
-    history = getattr(station, "round_history", [])
-    malicious = set(malicious_uavs)
+def _count_checkpoints_created(station, history: List[RoundSnapshot]) -> object:
+    """Exact count of checkpoints created during the run.
+
+    hfl_recovery.HFLRecoveryStation.run() saves an initial checkpoint at
+    t_c=0 before round 1, then _maybe_checkpoint() bumps
+    checkpoint_store.t_c to the current round whenever kappa >= kappa_th.
+    Each RoundSnapshot.last_checkpoint_round mirrors checkpoint_store.t_c
+    for that round, so every time that value changes from the previous
+    round, exactly one new checkpoint was created that round.
+
+    Returns "N/A" if this station has no checkpoint_store (base/rl mode).
+    """
+    if not hasattr(station, "checkpoint_store") or not history:
+        return "N/A"
+    tc_sequence = [0] + [s.last_checkpoint_round for s in history]
+    created = 1  # the initial checkpoint saved at t_c=0 before round 1
+    for prev_tc, tc in zip(tc_sequence, tc_sequence[1:]):
+        if tc != prev_tc:
+            created += 1
+    return created
+
+
+def _count_rollbacks(station, history: List[RoundSnapshot]) -> object:
+    """Exact count of checkpoint rollbacks during the run.
+
+    HFLRecoveryStation.train_round() calls _rollback_and_reconstruct()
+    exactly once per round in which any UAV was newly EXCLUDED that round.
+    EXCLUDED is a terminal state, so excluded_uavs only ever increases;
+    counting rounds where it grew versus the previous round gives the
+    exact number of rollbacks triggered.
+
+    Returns "N/A" if this station has no checkpoint_store (base/rl mode).
+    """
+    if not hasattr(station, "checkpoint_store") or not history:
+        return "N/A"
+    excluded_sequence = [0] + [s.excluded_uavs for s in history]
+    return sum(
+        1 for prev_n, n in zip(excluded_sequence, excluded_sequence[1:]) if n > prev_n
+    )
+
+
+def print_simulation_summary(
+    station,
+    mode: str,
+    coalitions: List[CoalitionSpec],
+    malicious_uavs: Sequence[str],
+    num_rounds: int,
+) -> None:
+    """Print a concise terminal-only execution summary (no file output)."""
+    history: List[RoundSnapshot] = getattr(station, "round_history", []) or []
+    total_coalitions = len(coalitions)
+    total_uavs = sum(len(members) for _, members in coalitions)
+    malicious_set = set(malicious_uavs)
+    total_malicious = len(malicious_set)
+
+    print("\n====================================")
+    print("Simulation Summary")
+    print("====================================")
+    print(f"Total rounds        : {num_rounds}")
+    print(f"Total coalitions     : {total_coalitions}")
+    print(f"Total UAVs           : {total_uavs}")
+    print(f"Total malicious UAVs : {total_malicious}")
 
     if not history:
-        checks.append(("Round history captured", False, "No round snapshots recorded"))
-        return checks
+        print("\nNo round history was recorded for this run (mode="
+              f"{mode!r}); RL/reputation/checkpoint stats are unavailable.")
+        print("====================================")
+        return
 
-    checks.append(("Round history captured", True, f"{len(history)} rounds logged"))
+    final = history[-1]
+    final_uavs = final.uav_snapshots
 
-    # FLGuardian: malicious UAV should get higher λ than benign peers at least once
-    high_lambda_malicious = False
-    for snap in history:
-        mal_scores = [u.contamination_score for u in snap.uav_snapshots if u.uav_id in malicious]
-        benign_scores = [u.contamination_score for u in snap.uav_snapshots if u.uav_id not in malicious]
-        if mal_scores and benign_scores and max(mal_scores) > min(benign_scores) + 0.05:
-            high_lambda_malicious = True
-            break
-    checks.append((
-        "FLGuardian flags malicious UAV (λ)",
-        high_lambda_malicious,
-        "Malicious UAV λ exceeded benign minimum by >0.05 in at least one round"
-        if high_lambda_malicious else "Could not distinguish malicious UAV by contamination score",
-    ))
+    accuracies = [s.global_accuracy for s in history]
+    avg_accuracy = sum(accuracies) / len(accuracies)
+    max_accuracy = max(accuracies)
 
-    # PPO governance: quarantine or exclude should fire when λ is elevated
-    governance_fired = any(
-        u.action in ("QUARANTINE", "EXCLUDE")
-        for snap in history
-        for u in snap.uav_snapshots
-        if u.uav_id in malicious
+    avg_reputation = (
+        sum(u.reputation for u in final_uavs) / len(final_uavs) if final_uavs else 0.0
     )
-    checks.append((
-        "PPO quarantine/exclude on threat",
-        governance_fired,
-        "Malicious UAV received QUARANTINE or EXCLUDE"
-        if governance_fired else "No governance action on malicious UAV",
-    ))
-
-    # Global model still learns
-    acc_start = history[0].global_accuracy
-    acc_end = history[-1].global_accuracy
-    model_learns = acc_end >= 0.05
-    checks.append((
-        "Global model trains",
-        model_learns,
-        f"Accuracy {acc_start:.4f} → {acc_end:.4f}",
-    ))
-
-    # Recovery mode: checkpoint or exclude path exercised
-    if hasattr(station, "checkpoint_store"):
-        excluded = any(s.excluded_uavs > 0 for s in history)
-        checkpointed = station.checkpoint_store.t_c > 0
-        checks.append((
-            "Recovery subsystem engaged",
-            excluded or checkpointed,
-            f"checkpoint t_c={station.checkpoint_store.t_c}, "
-            f"max excluded={max(s.excluded_uavs for s in history)}",
-        ))
-
-    return checks
-
-
-def write_readiness_report(
-    station,
-    output_dir: str,
-    mode: str,
-    detector_name: str,
-    malicious_uavs: Sequence[str],
-    checks: List[Tuple[str, bool, str]],
-) -> str:
-    os.makedirs(output_dir, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    txt_path = os.path.join(output_dir, f"recon_readiness_{timestamp}.txt")
-    html_path = os.path.join(output_dir, f"recon_readiness_{timestamp}.html")
-
-    history: List[RoundSnapshot] = getattr(station, "round_history", [])
-    passed = sum(1 for _, ok, _ in checks if ok)
-    total = len(checks)
-    ready = passed == total
-
-    lines = [
-        "=" * 72,
-        "ReCon HFL — SYSTEM READINESS REPORT",
-        "=" * 72,
-        f"Generated : {datetime.now().isoformat(timespec='seconds')}",
-        f"Mode      : {mode}",
-        f"Detector  : {detector_name} (φ)",
-        f"Malicious : {', '.join(malicious_uavs) or 'none'}",
-        f"Verdict   : {'READY' if ready else 'NEEDS ATTENTION'} ({passed}/{total} checks passed)",
-        "",
-        "READINESS CHECKS",
-        "-" * 72,
-    ]
-    for name, ok, detail in checks:
-        status = "PASS" if ok else "FAIL"
-        lines.append(f"  [{status}] {name}")
-        lines.append(f"         {detail}")
-
-    lines.extend(["", "ROUND SUMMARY", "-" * 72])
-    lines.append(f"{'Rnd':>4} {'Acc':>8} {'Active':>7} {'Q':>3} {'Ex':>3}  Notable UAV actions")
-    lines.append("-" * 72)
-    for snap in history:
-        notable = [
-            f"{u.uav_id}:λ={u.contamination_score:.2f}→{u.action[:3]}"
-            for u in snap.uav_snapshots
-            if u.action != "ALLOW" or u.contamination_score > 0.4 or u.is_malicious
-        ]
-        lines.append(
-            f"{snap.round_idx:4d} {snap.global_accuracy:8.4f} "
-            f"{snap.active_uavs:7d} {snap.quarantined_uavs:3d} {snap.excluded_uavs:3d}  "
-            f"{', '.join(notable) or '—'}"
-        )
-
-    lines.extend(["", "PER-UAV FINAL STATE", "-" * 72])
-    if history:
-        final = history[-1]
-        lines.append(
-            f"{'UAV':<6} {'Coal':<5} {'λ':>6} {'ρ':>7} {'q':>3} {'State':<12} {'Action':<10} Mal?"
-        )
-        lines.append("-" * 72)
-        for u in final.uav_snapshots:
-            lines.append(
-                f"{u.uav_id:<6} {u.coalition_id:<5} {u.contamination_score:6.3f} "
-                f"{u.reputation:7.3f} {u.flag_count:3d} {u.participation:<12} "
-                f"{u.action:<10} {'yes' if u.is_malicious else 'no'}"
-            )
-
-    lines.append("=" * 72)
-    report_text = "\n".join(lines)
-
-    with open(txt_path, "w", encoding="utf-8") as f:
-        f.write(report_text)
-
-    check_rows = "".join(
-        f"<tr class=\"{'pass' if ok else 'fail'}\"><td>{name}</td>"
-        f"<td>{'PASS' if ok else 'FAIL'}</td><td>{detail}</td></tr>"
-        for name, ok, detail in checks
+    avg_contamination = (
+        sum(u.contamination_score for u in final_uavs) / len(final_uavs) if final_uavs else 0.0
     )
-    round_rows = "".join(
-        f"<tr><td>{s.round_idx}</td><td>{s.global_accuracy:.4f}</td>"
-        f"<td>{s.active_uavs}</td><td>{s.quarantined_uavs}</td>"
-        f"<td>{s.excluded_uavs}</td></tr>"
-        for s in history
+
+    checkpoints_created = _count_checkpoints_created(station, history)
+    rollbacks = _count_rollbacks(station, history)
+
+    mal_quarantined = sum(
+        1 for u in final_uavs if u.uav_id in malicious_set and u.participation == "QUARANTINED"
     )
-    uav_rows = ""
-    if history:
-        for u in history[-1].uav_snapshots:
-            uav_rows += (
-                f"<tr><td>{u.uav_id}</td><td>{u.coalition_id}</td>"
-                f"<td>{u.contamination_score:.3f}</td><td>{u.reputation:.3f}</td>"
-                f"<td>{u.flag_count}</td><td>{u.participation}</td>"
-                f"<td>{u.action}</td><td>{'yes' if u.is_malicious else 'no'}</td></tr>"
-            )
+    mal_excluded = sum(
+        1 for u in final_uavs if u.uav_id in malicious_set and u.participation == "EXCLUDED"
+    )
+    mal_active = sum(
+        1 for u in final_uavs if u.uav_id in malicious_set and u.participation == "ACTIVE"
+    )
 
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>ReCon Readiness Report</title>
-<style>
-  body {{ font-family: system-ui, sans-serif; margin: 2rem; background: #0f172a; color: #e2e8f0; }}
-  h1 {{ color: #38bdf8; }}
-  .verdict {{ font-size: 1.4rem; padding: 1rem; border-radius: 8px; margin: 1rem 0; }}
-  .ready {{ background: #14532d; border: 1px solid #22c55e; }}
-  .not-ready {{ background: #450a0a; border: 1px solid #ef4444; }}
-  table {{ border-collapse: collapse; width: 100%; margin: 1rem 0; }}
-  th, td {{ border: 1px solid #334155; padding: 0.5rem 0.75rem; text-align: left; }}
-  th {{ background: #1e293b; }}
-  tr.pass td:nth-child(2) {{ color: #4ade80; font-weight: bold; }}
-  tr.fail td:nth-child(2) {{ color: #f87171; font-weight: bold; }}
-  .meta {{ color: #94a3b8; }}
-</style>
-</head>
-<body>
-<h1>ReCon HFL — System Readiness</h1>
-<p class="meta">Mode: {mode} | Detector: {detector_name} | Malicious: {', '.join(malicious_uavs) or 'none'}</p>
-<div class="verdict {'ready' if ready else 'not-ready'}">
-  {'✓ SYSTEM READY' if ready else '✗ NEEDS ATTENTION'} — {passed}/{total} checks passed
-</div>
-<h2>Readiness Checks</h2>
-<table><tr><th>Check</th><th>Status</th><th>Detail</th></tr>{check_rows}</table>
-<h2>Round Summary</h2>
-<table><tr><th>Round</th><th>Accuracy</th><th>Active</th><th>Quarantined</th><th>Excluded</th></tr>{round_rows}</table>
-<h2>Final UAV State</h2>
-<table><tr><th>UAV</th><th>Coalition</th><th>λ</th><th>ρ</th><th>q</th><th>State</th><th>Action</th><th>Malicious</th></tr>{uav_rows}</table>
-</body>
-</html>"""
+    ben_quarantined = sum(
+        1 for u in final_uavs if u.uav_id not in malicious_set and u.participation == "QUARANTINED"
+    )
+    ben_excluded = sum(
+        1 for u in final_uavs if u.uav_id not in malicious_set and u.participation == "EXCLUDED"
+    )
 
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(html)
+    print("\nFinal counts:")
+    print(f"  Active      : {final.active_uavs}")
+    print(f"  Quarantined : {final.quarantined_uavs}")
+    print(f"  Excluded    : {final.excluded_uavs}")
 
-    print("\n" + report_text)
-    print(f"\nReports saved:")
-    print(f"  Text : {txt_path}")
-    print(f"  HTML : {html_path}")
-    return txt_path
+    print(f"\nAverage global accuracy    : {avg_accuracy:.4f}")
+    print(f"Highest global accuracy    : {max_accuracy:.4f}")
+    print(f"Average reputation         : {avg_reputation:.4f}")
+    print(f"Average contamination score: {avg_contamination:.4f}")
+
+    print(f"\nNumber of checkpoint rollbacks : {rollbacks}")
+    print(f"Number of checkpoints created  : {checkpoints_created}")
+
+    print("\nMalicious UAV statistics:")
+    print(f"  Quarantined  : {mal_quarantined}")
+    print(f"  Excluded     : {mal_excluded}")
+    print(f"  Still active : {mal_active}")
+
+    print("\nBenign UAV statistics:")
+    print(f"  Quarantined : {ben_quarantined}")
+    print(f"  Excluded    : {ben_excluded}")
+    print("====================================")
 
 
 def main() -> None:
@@ -389,7 +335,7 @@ def main() -> None:
 
     station = None
     if args.mode == "base":
-        run_base_mode(config, DEFAULT_COALITIONS)
+        station = run_base_mode(config, DEFAULT_COALITIONS)
     elif args.mode == "rl":
         station = run_rl_mode(
             config, DEFAULT_COALITIONS, detector, malicious, args.poison_scale
@@ -406,14 +352,12 @@ def main() -> None:
         )
 
     if station is not None:
-        checks = _readiness_checks(station, malicious)
-        write_readiness_report(
+        print_simulation_summary(
             station,
-            args.output_dir,
             args.mode,
-            args.detector,
+            DEFAULT_COALITIONS,
             malicious,
-            checks,
+            args.rounds,
         )
 
 

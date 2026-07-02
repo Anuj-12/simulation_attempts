@@ -3,22 +3,26 @@ PPO-based UAV state management for ReCon HFL (Sec. 4.2, Algorithm 1).
 
 Builds on hfl_base.py and implements:
   - Observation o_j = (lambda_j, q_j, rho_j)           (Eq. 20)
-  - Action space {Allow, Quarantine, Exclude}        (Eq. 23)
+  - Action space {Allow, Quarantine, Exclude}        (Eq. 23), a_j ~ pi_theta
   - Reputation update                                 (Eq. 7)
   - Quarantine duration T_j^Q                         (Eq. 28)
-  - Reward R_j                                        (Eq. 26–27)
-  - PPO clipped objective + value + entropy losses    (Eq. 21, 29–33)
+  - Reward R_j = rho_j + Delta psi_j + Lambda(a)      (Eq. 26-27)
+  - PPO clipped objective + value + entropy losses    (Eq. 21, 29-33)
 
 Contamination detection phi(g_j) is injectable; a zero-score stub is used
 by default until an external detector is provided.
 
-Recovery / checkpoint mechanisms (Sec. 4.3) are intentionally omitted.
+Checkpoint urgency + rollback recovery (Sec. 4.3, Algorithm 2) is NOT
+implemented here; it is exclusive to hfl_recovery.HFLRecoveryStation, which
+extends this station. Per main.py's mode semantics, plain "rl" mode is PPO
+state management only.
 """
 
 from __future__ import annotations
 
 import copy
 import math
+import random
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Callable, Dict, List, Optional, Protocol, Sequence, Tuple
@@ -75,14 +79,26 @@ def zero_contamination_detector(_: "RLEdgeUAV") -> float:
 
 @dataclass
 class RLConfig:
-    """Hyper-parameters for reputation and PPO (ReCon Sec. 4.1–4.2)."""
+    """Hyper-parameters for reputation and PPO (ReCon Sec. 4.1-4.2)."""
 
     initial_reputation: float = 0.5          # rho_0
     reputation_lr: float = 0.1               # eta
     penalty_tuning: float = 1.0              # tau
-    initial_energy: float = 1000.0
-    default_contribution: float = 1.0        # phi_j placeholder
-    retraining_energy_scale: float = 10.0  # simplified E_j^ret
+    initial_energy: float = 1000.0           # E_j^init (Eq. energy_res)
+    default_contribution: float = 1.0        # phi_j fallback before first GTG-Shapley pass
+    checkpoint_threshold: float = 5.0        # kappa_th (Eq. checkpoint_trigger)
+
+    # DVFS computation-energy model (Eq. energy_comp / energy_prop / energy_agg)
+    flops_per_sample: float = 1e6            # alpha: FLOPs required per data sample
+    flops_per_cycle: float = 1e9             # B_j: FLOPs computed per CPU cycle
+    zeta: float = 1e-27                      # zeta_j: effective switched capacitance
+    cpu_frequency: float = 1e9               # f_j: CPU clock frequency (Hz)
+    prop_c1: float = 0.5                     # c1: parasitic-power constant (Eq. energy_prop)
+    prop_c2: float = 100.0                   # c2: induced-power constant (Eq. energy_prop)
+    velocity: float = 10.0                   # v: constant UAV flight velocity (m/s)
+
+    # GTG-Shapley contribution estimate (Eq. contri / contri_psi)
+    shapley_permutations: int = 1            # number of MC permutation samples per round
 
     # PPO
     ppo_lr: float = 3e-4
@@ -105,6 +121,7 @@ class RLEdgeUAV(EdgeUAV):
 
     participation: ParticipationState = ParticipationState.ACTIVE
     reputation: float = 0.5
+    reputation_at_t: float = 0.5             # rho_j^(t), cached before Eq. 7 update, used in reward Eq. 26
     flag_count: int = 0
     contamination_score: float = 0.0
     quarantine_rounds_remaining: int = 0
@@ -140,7 +157,8 @@ class RLEdgeUAV(EdgeUAV):
         )
 
     def update_reputation(self, eta: float, tau: float) -> float:
-        """Eq. 7 (energy terms normalized to keep ρ in a stable range)."""
+        """Eq. 7 (energy terms normalized to keep rho in a stable range)."""
+        self.reputation_at_t = self.reputation  # rho_j^(t), used by reward Eq. 26
         lam = self.contamination_score
         q = self.flag_count
         e_res = self.residual_energy / 1000.0
@@ -157,7 +175,7 @@ class RLEdgeUAV(EdgeUAV):
         """T_j^Q = exp(tau * q_j) / (1 + rho_j)  (Eq. 28)."""
         self.flag_count += 1
         duration = int(math.exp(tau * self.flag_count) / (1.0 + max(self.reputation, 0.0)))
-        self.quarantine_rounds_remaining = max(duration, 1)
+        self.quarantine_rounds_remaining = max(duration, 0)
         self.participation = ParticipationState.QUARANTINED
         return self.quarantine_rounds_remaining
 
@@ -245,7 +263,7 @@ class RLFogUAV(FogUAV):
 
 
 # ---------------------------------------------------------------------------
-# PPO agent (Eq. 21, 24–25, 29–33)
+# PPO agent (Eq. 21, 24-25, 29-33)
 # ---------------------------------------------------------------------------
 
 
@@ -269,11 +287,23 @@ class ActorCritic(nn.Module):
         value = self.value_head(features).squeeze(-1)
         return logits, value
 
-    def act(self, obs: torch.Tensor) -> Tuple[int, float, float, torch.Tensor]:
+    def act(
+        self, obs: torch.Tensor, action_mask: Optional[torch.Tensor] = None
+    ) -> Tuple[int, float, float, torch.Tensor, torch.Tensor]:
         logits, value = self.forward(obs)
+        if action_mask is not None:
+            # Masked actions get -inf logits so Categorical never samples them,
+            # and log_prob/entropy stay consistent with the restricted support.
+            logits = logits.masked_fill(~action_mask, float("-inf"))
         dist = Categorical(logits=logits)
         action = dist.sample()
-        return int(action.item()), float(dist.log_prob(action).item()), float(value.item()), dist.entropy()
+        return (
+            int(action.item()),
+            float(dist.log_prob(action).item()),
+            float(value.item()),
+            dist.entropy(),
+            dist.probs.detach(),
+        )
 
 
 @dataclass
@@ -325,11 +355,29 @@ class PPOAgent:
         self.network = ActorCritic(hidden_dim=rl_config.hidden_dim).to(device)
         self.optimizer = torch.optim.Adam(self.network.parameters(), lr=rl_config.ppo_lr)
         self.buffer: List[Transition] = []
+        # Training-stability guard (not part of the paper's formulation): the
+        # policy network starts randomly initialized, so its action distribution
+        # is close to uniform until it has received at least one gradient step.
+        # Since Exclude is an absorbing action (excluded UAVs never rejoin),
+        # letting an untrained policy pick it risks permanently and arbitrarily
+        # removing benign UAVs before the reward signal has taught the policy
+        # anything. has_updated tracks whether update() has run at least once;
+        # callers can use it to mask Exclude out of the action space until then.
+        self.has_updated: bool = False
 
-    def select_action(self, obs: torch.Tensor) -> Tuple[UAVAction, float, float]:
+    def select_action(
+        self, obs: torch.Tensor, allow_exclude: bool = True
+    ) -> Tuple[UAVAction, float, float, List[float]]:
         obs = obs.to(self.device)
-        action_idx, log_prob, value, _ = self.network.act(obs)
-        return UAVAction(action_idx), log_prob, value
+        action_mask = None
+        if not allow_exclude:
+            action_mask = torch.tensor(
+                [a != UAVAction.EXCLUDE.value for a in range(len(UAVAction))],
+                dtype=torch.bool,
+                device=self.device,
+            )
+        action_idx, log_prob, value, _, probs = self.network.act(obs, action_mask=action_mask)
+        return UAVAction(action_idx), log_prob, value, probs.tolist()
 
     def store(self, transition: Transition) -> None:
         self.buffer.append(transition)
@@ -397,6 +445,7 @@ class PPOAgent:
             }
 
         self.clear_buffer()
+        self.has_updated = True
         return clip_stats
 
 
@@ -405,25 +454,159 @@ class PPOAgent:
 # ---------------------------------------------------------------------------
 
 
-def estimate_retraining_energy(uav: RLEdgeUAV, coalition: RLCoalition, scale: float) -> float:
-    """Simplified stand-in for Eq. 13–15 until full energy model is wired."""
-    return scale * max(len(coalition.edge_uavs) - 1, 1)
+def _print_state_transitions(
+    rows: List[Tuple[int, str, str, str, str, Optional[int], float]]
+) -> None:
+    """Print one line per UAV decision this round, showing the participation
+    state transition actually caused by the PPO action (not just the raw
+    action/observation metrics)."""
+    for round_idx, uav_id, prev_state, new_state, action_name, quarantine_duration, reward in rows:
+        transition = f"{prev_state} -> {new_state}" if prev_state != new_state else f"{prev_state} (unchanged)"
+        extra = f" T_Q={quarantine_duration}" if quarantine_duration else ""
+        print(
+            f"Round {round_idx:>3} | {uav_id:<8} | {transition:<28} | "
+            f"action={action_name:<10}{extra} | reward={reward:8.3f}"
+        )
+
+
+def compute_computation_energy(num_samples: int, cfg: "RLConfig") -> float:
+    """E_j^comp = (G_j / B_j) * zeta_j * f_j^2,  G_j = alpha * n_j  (Eq. energy_comp).
+
+    Sensor datasets partition u_j's data, so sum_h |D_h^j| = n_j.
+    """
+    g_j = cfg.flops_per_sample * num_samples
+    return (g_j / cfg.flops_per_cycle) * cfg.zeta * (cfg.cpu_frequency ** 2)
+
+
+def compute_propulsion_energy(num_samples: int, cfg: "RLConfig") -> float:
+    """E_j^prop = (c1 v^3 + c2/v) * T_j^comp,  T_j^comp = G_j / (B_j f_j)  (Eq. energy_prop)."""
+    g_j = cfg.flops_per_sample * num_samples
+    t_comp = g_j / (cfg.flops_per_cycle * cfg.cpu_frequency)
+    return (cfg.prop_c1 * cfg.velocity ** 3 + cfg.prop_c2 / cfg.velocity) * t_comp
+
+
+def compute_residual_energy(num_samples: int, cfg: "RLConfig") -> float:
+    """E_j^res = E_j^init - E_j^comp - E_j^prop  (Eq. energy_res)."""
+    e_comp = compute_computation_energy(num_samples, cfg)
+    e_prop = compute_propulsion_energy(num_samples, cfg)
+    return cfg.initial_energy - e_comp - e_prop
+
+
+def compute_aggregation_energy(coalition_size: int, total_params: int, cfg: "RLConfig") -> float:
+    """E_j^agg = (G_k^agg / B_k) * zeta_k * f_k^2,  G_k^agg = Omega * (2|c_k| - 1)  (Eq. energy_agg)."""
+    g_agg = total_params * max(2 * coalition_size - 1, 1)
+    return (g_agg / cfg.flops_per_cycle) * cfg.zeta * (cfg.cpu_frequency ** 2)
+
+
+def compute_retraining_energy(uav: RLEdgeUAV, coalition: "RLCoalition", cfg: "RLConfig") -> float:
+    """E_j^ret = sum_{u_h in c_k \\ {u_j}} E_h^comp + E_j^agg  (Eq. energy_ret)."""
+    peers = [u for u in coalition.edge_uavs if u.uav_id != uav.uav_id]
+    comp_sum = sum(compute_computation_energy(u.num_samples, cfg) for u in peers)
+    total_params = sum(p.numel() for p in uav.model.parameters())
+    agg = compute_aggregation_energy(len(coalition.edge_uavs), total_params, cfg)
+    return comp_sum + agg
+
+
+def _aggregate_subset_weights(
+    base_weights: Dict[str, torch.Tensor], subset: Sequence[RLEdgeUAV]
+) -> Dict[str, torch.Tensor]:
+    """M_S = M^(t) + sum_{u in S} (n_u / N_S) * Delta_u^(t+1)  (Eq. contri_psi)."""
+    if not subset:
+        return {k: v.clone() for k, v in base_weights.items()}
+    total = sum(u.num_samples for u in subset)
+    result = {k: v.clone() for k, v in base_weights.items()}
+    for u in subset:
+        weight = u.num_samples / total
+        u_state = u.state_dict()
+        for key in result:
+            result[key] = result[key] + weight * (u_state[key] - base_weights[key])
+    return result
+
+
+def _evaluate_weights_accuracy(
+    weights: Dict[str, torch.Tensor],
+    probe: nn.Module,
+    dataset: Dataset,
+    config: HFLConfig,
+) -> float:
+    """psi(S) = Acc(M_S, D^val)  (Eq. contri_psi)."""
+    probe.load_state_dict(weights)
+    probe.eval()
+    loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=False)
+    correct, total = 0, 0
+    with torch.no_grad():
+        for images, labels in loader:
+            images = images.to(config.device)
+            labels = labels.to(config.device)
+            correct += (probe(images).argmax(dim=1) == labels).sum().item()
+            total += labels.size(0)
+    return correct / max(total, 1)
+
+
+def compute_gtg_shapley_contribution(
+    uav: RLEdgeUAV,
+    coalition: "RLCoalition",
+    base_weights: Dict[str, torch.Tensor],
+    validation_dataset: Dataset,
+    config: HFLConfig,
+    num_permutations: int = 1,
+) -> float:
+    """phi_j = E_{pi ~ Pi_k}[ psi(S_uj^pi U {u_j}) - psi(S_uj^pi) ]  (Eq. contri).
+
+    GTG-Shapley approximation: reuses each peer's already-trained local model
+    update (Delta_u^(t+1)) instead of retraining from scratch, and estimates
+    the expectation over permutations with `num_permutations` random draws.
+    """
+    peers = [u for u in coalition.active_edge_uavs if u.uav_id != uav.uav_id]
+    if num_permutations <= 0:
+        return 0.0
+    probe = copy.deepcopy(uav.model)
+    samples: List[float] = []
+    for _ in range(max(num_permutations, 1)):
+        perm = peers[:]
+        random.shuffle(perm)
+        prefix_len = random.randint(0, len(perm))
+        prefix = perm[:prefix_len]
+        s_weights = _aggregate_subset_weights(base_weights, prefix)
+        s_with_uj_weights = _aggregate_subset_weights(base_weights, prefix + [uav])
+        acc_before = _evaluate_weights_accuracy(s_weights, probe, validation_dataset, config)
+        acc_after = _evaluate_weights_accuracy(s_with_uj_weights, probe, validation_dataset, config)
+        samples.append(acc_after - acc_before)
+    return sum(samples) / len(samples)
 
 
 def compute_reward(
     uav: RLEdgeUAV,
     delta_psi: float,
-    quarantine_assigned: int,
-    rl_config: RLConfig,
+    action: UAVAction,
+    quarantine_duration: int,
 ) -> float:
-    lam = uav.contamination_score
-    e_ret = max(uav.retraining_energy, 0.0)
-    return (
-        uav.reputation
-        + delta_psi
-        - float(quarantine_assigned)
-        - lam * math.log1p(e_ret)
-    )
+    """R_j^(t+1) = rho_j^(t) + Delta psi_j^(t) + Lambda(a)  (Eq. 26-27).
+
+    Lambda(a) is piecewise in the action actually taken:
+      Allow      -> 0
+      Quarantine -> -T_j^Q(t)
+      Exclude    -> -(1 - lambda_j^(t)) * rho_j^(t)
+
+    Unlike a flat penalty, this term must apply *only* when the UAV is
+    excluded, and must scale with (1 - lambda_j) and rho_j^(t), not
+    lambda_j, per Eq. 27.
+    """
+    if action == UAVAction.ALLOW:
+        penalty = 0.0
+    elif action == UAVAction.QUARANTINE:
+        penalty = -float(quarantine_duration)
+    elif action == UAVAction.EXCLUDE:
+        lam = uav.contamination_score
+        rho = uav.reputation_at_t
+        penalty = -(1.0 - lam) * rho
+    else:
+        raise ValueError(f"Unrecognized action {action!r}")
+
+    # Eq. 26 uses rho_j^(t) explicitly (not the rho_j^(t+1) already computed
+    # this round by _update_reputations via Eq. 7), so the pre-update value
+    # cached in reputation_at_t must be used here rather than uav.reputation.
+    return uav.reputation_at_t + delta_psi + penalty
 
 
 # ---------------------------------------------------------------------------
@@ -433,9 +616,8 @@ def compute_reward(
 
 class HFLRLStation(BaseStation):
     """
-    Extends BaseStation with PPO-based UAV state management (Algorithm 1).
-
-    Recovery / checkpoint steps from Sec. 4.3 are not included.
+    Extends BaseStation with PPO-based UAV state management (Algorithm 1)
+    and checkpoint-based contamination recovery (Sec. 4.3, Algorithm 2).
     """
 
     def __init__(
@@ -451,6 +633,13 @@ class HFLRLStation(BaseStation):
         self.validation_set: Optional[Dataset] = None
         self.round_actions: Dict[str, UAVAction] = {}
         self.round_history: List[RoundSnapshot] = []
+        # NOTE: checkpoint/rollback (Sec. 4.3, Algorithm 2) is intentionally NOT
+        # implemented here. Per main.py's mode semantics, "rl" mode is PPO state
+        # management only; checkpoint-based recovery is exclusive to "recovery"
+        # mode, implemented in hfl_recovery.HFLRecoveryStation. Duplicating it
+        # here previously caused self.checkpoint_store's type to be clobbered
+        # (CheckpointStore -> plain dict) and used the wrong threshold
+        # (rl_config instead of recovery_config), corrupting HFLRecoveryStation.
 
     @property
     def rl_edge_uavs(self) -> List[RLEdgeUAV]:
@@ -474,7 +663,7 @@ class HFLRLStation(BaseStation):
 
     def _run_contamination_detection(self, reference_weights: Dict[str, torch.Tensor]) -> None:
         """
-        Run φ on each coalition via fog UAV (Sec. 3, Eq. lamda_def).
+        Run phi on each coalition via fog UAV (Sec. 3, Eq. lamda_def).
 
         Supports coalition-level adapters (FLGuardianHFLAdapter) and legacy
         per-UAV callables.
@@ -487,49 +676,53 @@ class HFLRLStation(BaseStation):
         for coalition in self.rl_coalitions:
             active = coalition.active_edge_uavs
             if hasattr(self.detector, "score_coalition"):
-                self.detector.score_coalition(active)
+                scores = self.detector.score_coalition(active)
+                for uav in active:
+                    uav.contamination_score = float(scores.get(uav.uav_id, 0.0))
             else:
                 for uav in active:
                     uav.contamination_score = self.detector(uav)
 
-    def _update_reputations(self) -> None:
+    def _update_reputations(self, reference_weights: Dict[str, torch.Tensor]) -> None:
         for coalition in self.rl_coalitions:
             for uav in coalition.active_edge_uavs:
-                uav.contamination_score = self.detector(uav)
-                uav.retraining_energy = estimate_retraining_energy(
-                    uav, coalition, self.rl_config.retraining_energy_scale
-                )
-                uav.residual_energy = max(uav.residual_energy - 1.0, 0.0)
+                # lambda_j^(t) already set by _run_contamination_detection (Eq. 6);
+                # do not resample it here.
+                uav.retraining_energy = compute_retraining_energy(uav, coalition, self.rl_config)
+                uav.residual_energy = compute_residual_energy(uav.num_samples, self.rl_config)
+                if self.validation_set is not None:
+                    uav.model_contribution = compute_gtg_shapley_contribution(
+                        uav,
+                        coalition,
+                        reference_weights,
+                        self.validation_set,
+                        self.config,
+                        self.rl_config.shapley_permutations,
+                    )
                 uav.update_reputation(self.rl_config.reputation_lr, self.rl_config.penalty_tuning)
 
     def _score_and_update_reputation(self, uav: RLEdgeUAV, coalition: RLCoalition) -> None:
-        """Legacy helper — prefer _run_contamination_detection + _update_reputations."""
+        """Legacy helper - prefer _run_contamination_detection + _update_reputations."""
         uav.contamination_score = self.detector(uav)
-        uav.retraining_energy = estimate_retraining_energy(uav, coalition, self.rl_config.retraining_energy_scale)
-        uav.residual_energy = max(uav.residual_energy - 1.0, 0.0)
+        uav.retraining_energy = compute_retraining_energy(uav, coalition, self.rl_config)
+        uav.residual_energy = compute_residual_energy(uav.num_samples, self.rl_config)
         uav.update_reputation(self.rl_config.reputation_lr, self.rl_config.penalty_tuning)
-
-    def _select_governance_action(self, uav: RLEdgeUAV, rl_action: UAVAction) -> UAVAction:
-        """
-        Bootstrap policy from FLGuardian λ while PPO is learning (Sec. 4.2).
-
-        High λ → quarantine/exclude; low λ → allow.  Ambiguous band defers to PPO.
-        """
-        lam = uav.contamination_score
-        if lam >= 0.85 and uav.flag_count >= 1:
-            return UAVAction.EXCLUDE
-        if lam >= 0.55:
-            return UAVAction.QUARANTINE
-        if lam <= 0.25:
-            return UAVAction.ALLOW
-        return rl_action
 
     def _manage_states(self, round_idx: int) -> Dict[str, Dict[str, float]]:
         """
-        PPO state decision per coalition (Algorithm 1, lines 10–24).
+        PPO state decision per coalition (Algorithm 1, lines 10-24).
         Returns per-UAV metadata needed for reward computation.
+
+        Only UAVs currently in ParticipationState.ACTIVE are ever fed through
+        the PPO agent. EXCLUDED UAVs are permanently removed from Algorithm 1's
+        decision loop (exclude() is a terminal state - nothing ever resets a
+        UAV out of EXCLUDED), so they must never reappear here. QUARANTINED
+        UAVs are likewise skipped, but unlike EXCLUDED they are eligible to
+        re-enter this loop once tick_quarantine() restores them to ACTIVE
+        (Algorithm 1, line 29 / _process_quarantine_expiry).
         """
         meta: Dict[str, Dict[str, float]] = {}
+        transition_rows: List[Tuple[int, str, str, str, str, Optional[int], float]] = []
 
         for coalition in self.rl_coalitions:
             acc_before = (
@@ -539,17 +732,34 @@ class HFLRLStation(BaseStation):
             )
 
             for uav in list(coalition.active_edge_uavs):
+                # Defensive guard: active_edge_uavs already filters to
+                # ParticipationState.ACTIVE, but we assert it explicitly here
+                # so that EXCLUDED (terminal) and QUARANTINED (temporarily
+                # ineligible) UAVs can never be handed a PPO decision, even if
+                # this method is refactored to iterate a different source list
+                # in the future.
+                if uav.participation != ParticipationState.ACTIVE:
+                    continue
+
+                prev_participation = uav.participation
                 obs = uav.observation()
-                rl_action, log_prob, value = self.ppo.select_action(obs)
-                action = self._select_governance_action(uav, rl_action)
+                action, log_prob, value, probs = self.ppo.select_action(
+                    obs, allow_exclude=self.ppo.has_updated
+                )
                 quarantine_assigned = 0
 
-                fog = coalition.fog_uav
-                if isinstance(fog, RLFogUAV):
-                    if action == UAVAction.QUARANTINE:
-                        quarantine_assigned = uav.assign_quarantine(self.rl_config.penalty_tuning)
-                    elif action == UAVAction.EXCLUDE:
-                        fog.apply_action(uav, action, self.rl_config.penalty_tuning)
+                # The action PPO selects must always be the action that is
+                # implemented on the UAV's participation state - previously
+                # this was gated behind `isinstance(fog, RLFogUAV)`, so a
+                # coalition with a plain FogUAV would silently record a
+                # QUARANTINE/EXCLUDE action (and reward it accordingly) while
+                # never actually changing uav.participation. Applying the
+                # action directly to the UAV removes that dependency on the
+                # fog's type and guarantees decision == effect.
+                if action == UAVAction.QUARANTINE:
+                    quarantine_assigned = uav.assign_quarantine(self.rl_config.penalty_tuning)
+                elif action == UAVAction.EXCLUDE:
+                    uav.exclude()
 
                 self.round_actions[uav.uav_id] = action
 
@@ -561,12 +771,22 @@ class HFLRLStation(BaseStation):
                 delta_psi = acc_after - acc_before
                 acc_before = acc_after
 
-                reward = compute_reward(uav, delta_psi, quarantine_assigned, self.rl_config)
+                reward = compute_reward(uav, delta_psi, action, quarantine_assigned)
                 meta[uav.uav_id] = {
                     "reward": reward,
                     "delta_psi": delta_psi,
                     "quarantine_assigned": float(quarantine_assigned),
                 }
+
+                transition_rows.append((
+                    round_idx,
+                    uav.uav_id,
+                    prev_participation.name,
+                    uav.participation.name,
+                    action.name,
+                    quarantine_assigned or None,
+                    reward,
+                ))
 
                 self.ppo.store(Transition(
                     obs=obs,
@@ -576,6 +796,9 @@ class HFLRLStation(BaseStation):
                     reward=reward,
                     done=(action == UAVAction.EXCLUDE),
                 ))
+
+        if transition_rows:
+            _print_state_transitions(transition_rows)
 
         return meta
 
@@ -591,7 +814,7 @@ class HFLRLStation(BaseStation):
             uav.apply_poison(reference_weights)
 
         self._run_contamination_detection(reference_weights)
-        self._update_reputations()
+        self._update_reputations(reference_weights)
 
         self._manage_states(round_idx)
 
@@ -716,8 +939,8 @@ class HFLRLStation(BaseStation):
             if uav.participation != "ACTIVE" or uav.contamination_score > 0.3 or uav.is_malicious:
                 print(
                     f"  {uav.uav_id} [{uav.coalition_id}] "
-                    f"λ={uav.contamination_score:.3f} ρ={uav.reputation:.3f} "
-                    f"q={uav.flag_count} → {uav.action} ({uav.participation})"
+                    f"lambda={uav.contamination_score:.3f} rho={uav.reputation:.3f} "
+                    f"q={uav.flag_count} -> {uav.action} ({uav.participation})"
                     + (f" TQ={uav.quarantine_remaining}" if uav.quarantine_remaining else "")
                     + (" [MALICIOUS]" if uav.is_malicious else "")
                 )

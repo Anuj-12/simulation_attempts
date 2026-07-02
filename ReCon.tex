@@ -1,0 +1,771 @@
+\documentclass[10pt,journal,compsoc]{IEEEtran}
+\usepackage{verbatim}
+\pagestyle{headings}
+\usepackage{amssymb}
+\usepackage{amsmath}
+\usepackage{epstopdf}
+\usepackage{esint}
+\usepackage{mathtools}
+\usepackage{dblfloatfix}
+%\newcounter{MYtempeqncnt}
+\usepackage{setspace}
+\usepackage{ellipsis}
+\usepackage{textcomp} %\usepackage{amsthm}
+\usepackage{cite}
+\usepackage{enumerate}
+\usepackage{caption}
+\usepackage{graphicx}
+\usepackage{subfigure}
+\usepackage{subcaption}
+\usepackage{epsfig}
+%\documentclass{article}
+%\usepackage[demo]{graphicx}
+%\usepackage{algorithm}
+% \usepackage[linesnumbered,ruled,vlined]{algorithm2e}
+%\usepackage{algpseudocode}
+% \usepackage{algorithmicx}
+% \usepackage{epstopdf}
+% \usepackage{psfrag}
+% \usepackage{grffile}
+% \usepackage{epstopdf}
+\usepackage{float}	%minipage
+%\usepackage[ruled,vlined,commentsnumbered]{algorithm2e}
+\usepackage{algorithm,algpseudocode}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{array}
+\usepackage{xcolor}
+\usepackage{setspace}
+\setlength\abovedisplayskip{0pt}
+\setlength\belowdisplayskip{0pt}
+% \SetKwInput{KwInput}{Input}                % Set the Input
+% \SetKwInput{KwOutput}{Output}
+%\theoremstyle{definition}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{mydef}{\textbf{\textit{Definition}}}
+\newtheorem{propo}{Proposition}
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{prope}{Property}
+\newtheorem{coro}{Corollary}
+\newtheorem{term}{Terminology}
+\usepackage[utf8]{inputenc}
+%\usepackage[english]{babel
+\usepackage{amsmath}
+\usepackage{amsthm}
+\usepackage{algorithmicx}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{hyperref}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue
+}
+\hyphenation{op-tical net-works semi-conduc-tor}
+
+
+\begin{document}
+\title{ReCon: A Reputation-Aware Contamination Governance and Recovery Framework for UAV-Based Hierarchical Federated Learning}
+\author{
+\IEEEauthorblockN{Anuj Tejas, Arijit Roy,~\IEEEmembership{ Member,~IEEE} }
+
+\IEEEcompsocitemizethanks{\IEEEcompsocthanksitem Arijit Roy is with the Department of Computer Science and Engineering, Indian Institute of Technology Patna, Bihar, India, Veera Manikantha Rayudu Tummala and Vinay Yadam are with the  Computer Science and Engineering Group, Indian Institute of Information Technology Sri City (IIITS), Andhra Pradesh, India (e-mail: arijitroy@iitp.ac.in; manikantharayudu.t21@iiits.in; vinay.y21@iiits.in).\protect\\}}
+% note need leading \protect in front of \\ to get a newline within \thanks as
+% \\ is fragile and will error, could use \hfil\break instead.
+%\IEEEcompsocthanksitem A. Roy is with the Department of Computer Science and Engineering Group, Indian Institute of Information Technology Sri City (IIITS), Andhra Pradesh, India (e-mail: arijit.r@iiits.in).}}% 
+
+% As a general rule, do not put math, special symbols or citations
+% in the abstract
+\IEEEtitleabstractindextext{%
+\begin{abstract}
+Gist of the whole work in 200-300 words:\\
+-- First statement: What are you doing\\
+-- Problems in the existing works/domains\\
+-- How you have solved the problem\\
+-- Gist of the results in \%
+\end{abstract}
+\begin{IEEEkeywords}
+Hierarchical Federated Learning, UAV-Assisted Federated Learning, Contamination Governance, Reputation-Aware Learning, Reinforcement Learning, Checkpoint-Based Recovery, Model Rollback
+\end{IEEEkeywords}}
+% For peer review papers, you can put extra information on the cover
+% page as needed:
+% \ifCLASSOPTIONpeerreview
+% \begin{center} \bfseries EDICS Category: 3-BBND \end{center}
+% \fi
+%
+% For peer-review papers, this IEEEtran command inserts a page break and
+% creates the second title. It will be ignored for other modes.
+\maketitle
+
+\IEEEdisplaynontitleabstractindextext
+
+\IEEEpeerreviewmaketitle
+
+
+\ifCLASSOPTIONcompsoc
+\IEEEraisesectionheading{\section{Introduction}\label{sec:introduction}}
+\else
+\section{Introduction}
+\label{sec:introduction}
+\fi
+\IEEEPARstart{I}{n} recent years Unmanned Aerial Vehicle (UAV) swarms have gained traction in academia and fields of application such as healthcare, military, agriculture, and transportation \cite{healthcare}, \cite{military}, \cite{agri}, \cite{transport}. Traditionally these swarms rely on a centralized architectures, i.e. they send all their collected data to the base station or a cloud server to train machine learning models, this can incur a large computational overhead for the centralized server hence, to handle this a distributed form of computing is used where the data collected is used to train the models carried by the UAVs themselves, only the updated gradients from that respective model are sent for further aggregation, this is known as Federated Learning (FL). 
+
+Although distributed learning models improve the efficiency of computation, they can be exploited by introducing malicious clients which seem to be part of the system but send data that poisons the global model. These clients need to be removed from the system before unlearning the parts of the global model affected by them, but it must also be taken into account that the UAVs might contain sensors that momentarily glitch or the UAV might fly over uneven terrain and produce erroneous data, these UAVs must not be removed permanently from the system as it will affect the network participation and global model training efficiency.
+
+In this paper we have devised a RL based solution to determine if a UAV is contaminating and quarantine it for a set amount of time depending on its impact on the global model and the amount of times it has been flagged as contaminating or exclude it from the completely exclude it from the system permanently if it is malicious.  
+
+\subsection{Motivation}
+Presently UAVs preform vast amounts of applications in various domains. These UAVs often use a distributed learning framework to collect and process their data, these frameworks are often susceptible external attacks aiming to halt the learning progress of the global model and degrade overall system performance. Existing literature widely covers contamination detection through various methods but does not reveal a work that covers the later parts of contamination detection i.e., the removal of the contaminating UAV and unlearning the contribution of the contaminating UAV. Since, no contamination detection model is accurate every time it can cause the removal of a non-contaminating UAV which might be facing a temporary problem such as a sensor glitch. Hence, it is in our best interest to give another chance to a potentially contaminating UAV to find out whether it really is malicious or facing temporary problems. Hence, we present a rejoining policy based solution which enhances network participation while maintaining the global model training efficiency.
+
+\subsection{Contribution}
+The main contributions of this work are summarized as follows:
+\begin{itemize}
+
+
+ \item Reputation aware UAV state determination system, which integrates historical reliability, impact on the global model, residual energy, and retraining cost. These factors are used to guide the reward driven classification in the RL framework.
+
+\item An reinforcement learning based approach to classify the UAV as clean, contaminating, and malicious. Clean UAVs are allowed to participate in collection and aggregation of data, whereas contaminating UAVs are quarantined based on the number of times they have been flagged and malicious UAVs are removed from the entire process permanently.
+
+\item A rollback based contamination recovery system is introduced to minimize the effects of contamination by the flagged malicious UAVs. This involves saving of the model by every fog UAV in the system if a checkpoint threshold is reached. The fog UAVs are restored to last check-pointed state and continue the aggregation process to reform the global model.
+
+\item A quarantine based system to temporarily remove the participation of UAVs flagged as contaminating. UAVs rejoin the aggregation after their quarantine period has ended, which increases exponentially according to the amount of it's contamination flags and current reputation. After rejoining they go through the process of contamination detection again and are placed in sets of participation according to the results. 
+
+\end{itemize}
+
+%
+%
+%
+\section{Related Work}
+% Detailed that you have explored in the literature -- include at least 8 IEEE Transactions papers (e.g. IEEE TSC, IEEE TVT, IEEE TMC, IEEE TWC, IEEE TNET, IEEE TNSM, IEEE TNSE), 5 conference papers (good old conference -- IEEE Globecom, IEEE ICC, IEEE INFOCOM, ACM Mobicom, ACM Mobihoc)
+
+This section reviews the prior research work covered in this area, which we have divided into three sub-parts: (i) UAV-assisted Hierarchical Federated Learning, (ii) Contamination Detection and Secure Federated Learning, (iii) Federated Unlearning and Model Recovery.
+
+\subsection{UAV-assisted Hierarchical Federated Learning}
+In the recent years the combination of federated learning and UAV swarm network has given rise to UAV assisted hierarchical federated learning as an effective paradigm for distributed machine learning on the edge for low cost computational energy, but extended use of UAVs has it's own caveats because of it's limited resources,
+to solve this Yang et. al. \cite{UAHFL:adaptive} propose a novel approach using a joint optimization problem integrating learning configuration, bandwidth allocation, and device to-UAV-association to minimize global aggregation time.
+Similarly, Khelf et. al. \cite{UAHFL:optimization} minimize the time required to reach the required learning accuracy by optimizing UAV placement, channel allocation, user association, and client selection, whereas works like, Zhagypar et. al. \cite{UAHFL:performance} propose an algorithm that compensates for unreliability of wireless communication by adapting the local and global aggregation weights according to the channel success probabilities and guarantee convergence. 
+
+\subsection{Contamination Detection and Secure Federated Learning}
+To address the increasing amount of attacks on federated learning systems, several authors have come up with methods to detect contaminating participants with varying methods, 
+Zhou et. al. \cite{ConD:FLGuardian} devise a method to cover the threat of backdoor Model Poisoning Attacks (MPAs) inherent to the distributed learning systems by using a layer-space defense mechanism called FLGaurdian, which can protect the global model from the state of the art MPAs and stay effective against MPAs tailored to the FLGaurdian using a trust based system.
+Khuu et. al. \cite{ConD:PoisonDet} propose an alogrithm that uses Shapley Additive Explanation (SHAP) values and Support Vector Machines (SVMs) to differentiate between honest and malicious clients.
+Singh et. al. \cite{ConD:FairDet} propose a robust federated learning model that provides just treatment to the legitimate minority groups, frequently present in non-IID systems, and attempt to find a balance between the diversity of the system and fighting poisoning.
+Yazdinejad et. al. \cite{ConD:RobustFL} introduces an internal auditor that evaluates gradient similarity of encrypted data and differentiates between malicious and benign updates to ensure that poisoned updates don't go through.
+Zhao et. al. \cite{ConD:DetectingFL} employ a defense mechanism to using Generative Adversarial Networks (GANs) to generate auditing data during the training procedure and remove harmful participants by auditing their model accuracy.
+
+\subsection{Federated Unlearning and Model Recovery}
+Federated unlearning has become an important research direction in the recent years to remove the influence of contaminating clients from a trained model or one being trained, 
+Liu et. al. \cite{Liu2021FedEraserEE} suggest a method that trades the central server's storage and uses that for the unlearned model's reconstruction time by leveraging the historical parameter updates of the federated clients.
+Mora et. al. \cite{Mora2026FederatedUV} develop a method that operates on distilled synthetic data generated by the clients, these samples preserve the training influence but are unrecognizable when compared to the original data, unlearning can be executed by the central server without the clients needing to be online or storing a historical record every client's participation.
+Mora et. al. \cite{Mora2024FedQUITOF} formulate a method that uses a teacher-student framework, where a modified version of the global model acts as the teacher and the client's model acts as a student, which enables them to achieve unlearning without making any additional assumptions over the FedAvg \cite{fedavg} protocol.
+
+Furthermore, existing papers cover methods to increase the efficiency for unlearning in the federated learning environment, 
+Halimi et. al. \cite{Halimi2022FederatedUH} propose that the unlearning be performed at the client that needs to be removed first and using this new unlearned model to run a small amount of federated learning to obtain the unlearned global models.
+Ameen et. al. \cite{Ameen2025SpeedUF} introduce a method that is faster at unlearning multiple clients' contribution to the global model parallel, but acts the same as existing methods when unlearning a single model.
+
+Another area of recent focus has been model recovery to restore model integrity after poisoning attacks by storing and using data like stored updates, or checkpoints, 
+Cao et. al. \cite{Cao2022FedRecoverRF} introduce a method that can recover the global model after a poisoning attack while keeping the computation and communication costs low by estimating every client's model updates instead of forcing the client to compute and communicate the updates during the recovery process.
+Jiang et. al. \cite{Jiang2024TowardEA} proposes a method that uses selective historical information and a historical model that has not been significantly affected by the malicious clients rather than the initial model to recover from a poisoning attack using an adaptive rollback mechanism.
+
+\textbf{Synthesis:} Although significant progress has been made in UAV assisted hierarchical federated learning, secure federated learning through various contamination detection methods, and model recovery  to restore the effectiveness of the model after performing unlearning after client removal. However, these research directions have grown independently and limited attention has been paid to the post contamination detection life-cycle, and especially the consideration and management of false contamination flags because of sensor glitches, uneven terrain and other factors that may cause a sudden change in the sensor readings. To address this gap, we propose a reputation aware contamination governance framework that integrates quarantining, rejoining, exclusion and checkpoint based recovery to establish better network participation, reducing contamination overhead, and reducing recovery overhead.
+
+%
+%
+%
+\section{Problem scenario}
+We consider a Hierarchical Federated Learning (HFL) environment within a UAV swarm where edge UAVs collect data and train their respective models on them. Let, $U=\{u_1, u_2, \dots, u_n\}$ represent the set of all edge UAVs in the system, these are further split into active UAVs ($U^A$), quarantined UAVs ($U^Q$), and excluded UAVs ($U^E$), only the active UAVs take part in the learning and aggregation processes
+each edge UAV \textit{j} consists of a set of sensors $S^j = \{s_1^j, s_2^j, \dots, s_o^j\}$.
+Similarly, the set of fog UAVs that aggregate the data locally for each coalition is represented by $H = \{h_1, h_2, \dots, h_m\}$, these UAVs are also responsible for running the contamination detection model ($\varphi$) on their specific coalitions; we don't go into the specifics of contamination detection in this paper since it has already been widely covered in the present literature. Hence $\varphi$ is essentially a black box for the system proposed in this paper.
+
+A single fog UAV is assigned to a coalition for aggregation of gradients and running the contamination detection on all the edge UAVs in the coalition, let this set of coalitions be represented by $C = \{c_1, c_2, \dots, c_m\}$.
+Hence, the fog UAV $h_i$ is the link between the edge UAVs in the coalition $c_i$ and the base station.
+
+Let the local dataset of edge UAV \textit{j} consisting of data collected by the all the sensors in the UAV be $D^j = \bigcup_{k =1}^{|S^j|} D^j_{k}$,
+hence the fractional contribution of each dataset \textit{k} over the total amount of data in a UAV \textit{j} can be given by $p_{jk} = \frac {n_{jk}} {n_j}$, where $n_{jk} = |D_{jk}|$ and $n_{j} = |D_{j}|$ such that $\sum_{k=1}^{|S^j|} p_{jk} = 1$. Hence, the process of training the model for a UAV becomes
+
+\begin{equation}
+% The minimum params that minimize the local loss fxn 
+\min_{w_j} F_j = \sum_{k=1}^{|S^j|} p_{jk} \, F_{jk}(w_j),
+\end{equation}
+
+where
+
+\begin{equation}
+F_{jk}(w_j)
+=
+\frac{1}{n_{jk}}
+\sum_{i=1}^{n_{jk}}
+f_{jk}(w_j; x_i^{jk}, y_i^{jk}).
+\end{equation}
+
+here, $f_{jk}(w_j; x_i^{jk}, y_i^{jk})$ denotes the loss function evaluated using model parameter $w_j$ on the $i$-th data sample $(x_i^{jk}, y_i^{jk})$ from dataset $D_{jk}$. Let the gradient for the j-th edge UAV be represented by
+
+\begin{equation}\label{eq:edge_grad}
+g_j = \nabla F_j(w_j)
+\end{equation}
+
+Every active edge UAV in the coalition sends its updated gradients to its respective fog node which then aggregates the complete data it receives, as seen in \eqref{eq:fog_agg} \cite{fedavg}. 
+
+\begin{subequations}\label{eq:fog_agg}
+\begin{align}
+g_k^F &= \sum_{u_j \in c_k} \frac{n_j}{N_k} g_j \\
+N_k &= \sum_{u_j \in c_k} n_j
+\end{align}
+\end{subequations}
+
+Finally, every fog node in the system sends its updated set of gradients to the base station for global aggregation, as seen in \eqref{eq:base_agg}, the base station then sends this data back to the fog nodes and the edge UAVs which then update their own models for further data processing and model training.
+
+\begin{subequations}\label{eq:base_agg}
+\begin{align}
+g^G &=
+\sum_{k=1}^{|C|}
+\sum_{u_j \in c_k}
+\frac{n_j}{N} \, g_j \\
+N &=
+\sum_{u_j \in U} n_j
+\end{align}
+\end{subequations}
+
+%--- MAYBE THE RIGHT PLACE TO BEGIN CONTAMINATION DETECTION ---
+The contamination detection model ($\varphi$) runs on every fog UAV and delivers a contamination score ($\lambda$) for every active edge UAV in the coalition, refer to \eqref{eq:lamda_def}, this score is a label of the possibility that the UAV might be malicious, but this might not be the case as the contamination detection can be falsely alerted by a sudden change in sensor readings due to a temporary sensor glitch, signal interference, spike in sensor readings due to sudden change in terrain, etc. 
+
+\begin{equation}\label{eq:lamda_def}
+\varphi: g_j \rightarrow [0,1], \quad \lambda = \varphi(g_j), \quad u_j \in c_k
+\end{equation}
+
+Architecture related kuch daalo to finish.
+
+
+
+%
+%
+%
+\section{ReCon: The Solution Approach}
+For the afore mentioned problem scenario we apply a RL based solution to segregate UAVs as clean, contaminating and malicious and treat them according to their detected states.
+
+\begin{mydef}
+Contaminating UAVs are the edge UAVs in a coalition that generate readings that are flagged by the contamination detection model, but this is a result of a sensor glitch, unusual change in terrain, etc. These UAVs don't have a malicious intent against the system.
+\end{mydef}
+
+\begin{mydef}
+Malicious UAVs are the edge UAVs in a coalition that generate readings that are meant to harm the integrity of the overall system and degrade global model performance. These UAVs are are a method of attack from an external entity on the system. 
+\end{mydef}
+
+
+\subsection{Reputation Driven Reliability Assessment}
+The proposed reputation model depends on five factors other than its past reputation - contamination score, model contribution,  residual energy, relearning energy, contamination flag count ($q_i$), these combine together to form the reward term and the penalty term, which along with the past reputation and learning rate ($\eta$), which is a design parameter, formulate the reputation ($\rho$) of a given UAV at round $t$ \eqref{eq:reputation}. The reputation is calculated for every active UAV, $u \in U^A$, for every round of aggregation.
+
+\begin{align}\label{eq:reputation}
+\rho_j^{(t+1)}
+&=
+\rho_j^{(t)}
++
+\eta
+\Bigg(
+\underbrace{
+(1-\lambda_j^{(t)})
+\left(
+\frac{E_j^{res (t)} \times \phi_j^{(t)}} {1+q_j^{(t)}}
+\right)
+}_\text{Reward Term}
+\nonumber\\
+&\quad
+-
+\underbrace{
+\lambda_j^{(t)}
+\left(
+\frac{E_j^{ret(t)} \times e^{(\tau q_j^{(t)})}}{\phi_j^{(t)}}
+\right)
+}_\text{Penalty term}
+\Bigg)
+\end{align}
+
+The reputation consists of two components, namely the reward term and the penalty term.
+The reward term promotes the gradual growth of the UAVs that contribute positively to the system, i.e. the UAVs with high residual energy \eqref{eq:energy_res}, high global model contribution \eqref{eq:contri} and low contamination flags. 
+Whereas, the penalty term punishes the UAVs with negatively affecting characteristics exponentially, which is tuned with the design parameter $\tau$ and takes into account the amount of contamination flags, the impact of the UAV's model on the global model, and the retraining energy required to compensate for their negative impact on the global model punishing the UAVs with a faulty history harshly.
+
+\begin{theorem}[Penalty Dominance under Repeated Flags]
+For fixed values of $E_j^{res(t)}$, $E_j^{ret(t)}$, and $\phi_j^{(t)}$, the penalty term increases exponentially with the increase in the contamination flags $q_j^{(t)}$, whereas the reward term decreases inversely with increase in the number of contamination flags.
+\end{theorem}
+ 
+\begin{proof}
+The penalty term in the reputation \eqref{eq:reputation} given below consists of an exponentially increasing term.
+
+\[
+P_j^{(t)}
+=
+(1-\lambda_j^{(t)})
+\left(
+\frac {
+E_j^{ret(t)} 
+\times
+e^{( \tau q_j^{(t)})}
+}
+{\phi_j^{(t)}}
+\right)
+\]
+
+Differentiating with respect to $q_j^{(t)}$:
+
+\[
+\frac{\partial P_j^{(t)}}{\partial q_j^{(t)}}
+=
+\tau
+\lambda_j^{(t)}
+\frac{E_j^{ret(t)} e^{(\tau q_j^{(t)})}}
+{\phi_j^{(t)}}
+\]
+
+We see that the entire penalty term increases exponentially, hence it dwarfs the reward term with increase in the contamination flags.
+\end{proof}
+
+\begin{coro}[Nonlinear Punishment of Repeat Offenders]
+Let $q_2 > q_1$. Then the ratio between the corresponding penalty terms
+is given by
+
+\[
+\frac{P_j(q_2)}{P_j(q_1)}
+=
+e^{\displaystyle \tau (q_2-q_1)}
+\]
+
+Hence, the penalty grows exponentially with the difference in
+contamination counts, implying that repeated contamination events are
+punished significantly more severely than isolated incidents.
+\end{coro}
+
+The residual energy is a powerful measure of the UAV's future capability, it is residual energy given by \eqref{eq:energy_res}, is a function of computation energy \eqref{eq:energy_comp} and propulsion energy \eqref{eq:energy_prop}, we assume communication energy to be negligible in comparison to the computation and propulsion energy.
+
+\begin{equation}\label{eq:energy_res}
+E_j^{res} = E_j^{init} - E_j^{comp} - E_j^{prop}
+\end{equation}
+
+The Dynamic Voltage and Frequency Scaling (DVFS) based computation energy \eqref{eq:energy_comp} \cite{comp_energy} is computed in terms of Floating Point Operations (FLOPs).
+Where, $G_j$ represents the total number of FLOPs required for the entire dataset of the UAV, as $\alpha$ represents the FLOPs needed for each data sample and $B_j$ stands for the FLOPs computed within a cycle. 
+
+\begin{align}\label{eq:energy_comp}
+E_j^{comp} 
+&=
+\frac {G_j} {B_j} \zeta_j f_j^2
+\\
+G_j
+&=
+\alpha \sum_{h = 1}^{|D^j|} |D_h^{j}|
+\end{align}
+
+The propulsion energy assuming constant velocity ($v$) \cite{prop_energy} is given by \eqref{eq:energy_prop}, where $c_1$ and $c_2$ are constants for parasitic power and induced power respectively. Since, the UAV is assumed to have constant velocity during the local model training, $T_j^{comp}$ is the time taken by $u_j$ to finish training it's local model and it is defined in terms of rate of completion of FLOPs in a cycle.
+
+\begin{align}\label{eq:energy_prop}
+E_j^{prop} 
+&= 
+\left( c_1 v^3 + \frac {c_2} {v} \right) 
+\cdot
+T_j^{comp}
+\\
+T_j^{comp}
+&=
+\frac{G_j}{B_j f_j}
+\end{align}
+
+
+\begin{mydef}
+ Retraining energy is the energy required to retrain an entire fog UAV if an edge UAV is removed from the aggregation process because of quarantine or exclusion.
+\end{mydef}
+
+For UAV $u_j \in c_k$ the retraining energy is given by
+
+\begin{equation}\label{eq:energy_ret}
+E_j^{ret}
+=
+\sum_{u_h \in c_k \setminus \{u_j\}}
+(E_h^{comp})
++
+E_j^{agg}
+\end{equation}
+
+\begin{align}\label{eq:energy_agg}
+E_j^{agg}
+&=
+\frac{G_k^{agg}}{B_k}
+\zeta_k f_k^2 .
+\\
+G_k^{agg}
+&= 
+\Omega (2|c_k|-1)
+\end{align}
+
+where, FLOPs required for addition and multiplication are assumed to be 1 and $\Omega$ is the total number of parameters in the fog UAV.
+
+An edge model's contribution ($\phi$) \eqref{eq:contri} on the global model is an important metric in the calculation of reputation, it shows the genuine impact of the edge UAV in the overall system. 
+The well known method to calculate the contribution is classic Shapley Value \cite{shapley}, it uses the utility value function ($\psi$) to determine the effect of a UAV on the global model, but this method has the limiting factor of high computational time. Hence, we apply the GTG-Shapley approximation \cite{gtg_shapley}, which reduces the need of reconstructing the model by using the previous gradient updates instead of training it from scratch every time \eqref{eq:contri_psi}.
+
+\begin{equation}\label{eq:contri}
+\phi_j
+= 
+\mathbb{E}_{\pi \sim \Pi_k}
+[
+\psi(S_{u_j}^{\pi} \cup  \{u_j\}) 
+-
+\psi(S_{u_j}^{\pi})
+]
+\end{equation}
+
+Here, we measure the utility on the updated previous model using a randomly selected permutation of edge UAVs in the coalition. The UAVs that occur before the current UAV ($u_j$), in the permutation are used to update the model. The utility is calculated by measuring the accuracy of prediction against the validation dataset ($D^{val}$). 
+Where, $\Delta_u^{(t+1)}$  is the gradient update for the edge UAV's local model, given by change in model after round's update.
+
+\begin{align}\label{eq:contri_psi}
+\psi(S_{u_j}^{\pi})
+&=
+\psi \left(
+M^{(t)} + \sum_{u \in S_{u_j}^{\pi}}
+\sum_{m = 1} ^{|D^u|}
+\frac {|D_m^u|} {D_{S_{u_j}^{\pi}}}
+\Delta_u^{(t+1)}
+\right)
+\\
+\Delta_u^{t+1} &= M_j^{t+1} - M^t
+\\
+\psi(\cdot) 
+&=
+Acc(M_{S_{u_j}^{\pi}}, D^{val})
+\end{align}
+
+
+\subsection{RL Based UAV State Detection}
+There are three possible states in which an edge UAV can exist, these are - clean, contaminating, and malicious. The determination of these states is formulated as a Partially Observable Markov Decision Process (POMDP) as the choice of the state has to be made through the observations from the UAV alone, this decision is made for every edge UAV in the system by their subsequent fog UAVs.
+
+
+\begin{algorithm}[t]
+\caption{PPO-Based UAV State Management}
+\label{alg:ppo_uav}
+\begin{algorithmic}[1]
+\Statex \textbf{Input:} UAV set $U$, Coalition set $\mathcal{C}$, PPO policy $\pi_\theta$
+\Statex \textbf{Output:} Actions $\{a_j^{(t)}\}$, Updated models $\{M_{c_k}^{(T)}\}$
+
+\State Initialize $\rho_j^{(0)} \leftarrow \rho_0$,\ $q_j^{(0)} \leftarrow 0$,\ $U^A \leftarrow U$,\ $U^Q, U^E \leftarrow \emptyset \quad \forall\, u_j \in U$
+
+\For{$t = 1$ \textbf{to} $T$}
+    \For{\textbf{each} $u_j \in U^A$} \Comment{Local training \& scoring}
+        \State Compute gradient $g_j^{(t)}$, contamination score $\lambda_j^{(t)} \leftarrow \varphi(g_j^{(t)})$
+        \State Compute $E_j^{\mathrm{res}(t)}$, $E_j^{\mathrm{ret}(t)}$, $\phi_j^{(t)}$ via GTG-Shapley; update $\rho_j^{(t+1)}$ via Eq.~(7)
+    \EndFor
+
+    \For{\textbf{each} $c_k \in \mathcal{C}$} \Comment{PPO state decisions}
+        \For{\textbf{each} $u_j \in c_k \cap U^A$}
+            \State $o_j^{(t)} \leftarrow [\lambda_j^{(t)},\, \rho_j^{(t)},\, q_j^{(t)}]$;\ \ $a_j^{(t)} \sim \pi_\theta(\cdot \mid o_j^{(t)})$
+            \If{$a_j^{(t)} = \textsc{Quarantine}$}\ \ $q_j^{(t)}{\mathrel{+}=}1$;\ compute $T_j^Q$ via Eq.~(28);\ move $u_j \to U^Q$
+            \ElsIf{$a_j^{(t)} = \textsc{Exclude}$}\ \ move $u_j \to U^E$
+            \EndIf
+        \EndFor
+        \State Aggregate $g_k^F$ via Eq.~(4); update $M_{c_k}^{(t)}$; compute $R_j^{(t+1)}$ via Eq.~(26)--(27)
+    \EndFor
+
+    \State Aggregate $g^G$ at base station via Eq.~(5); update $\theta \leftarrow \theta + \nabla_\theta \mathcal{L}^{\mathrm{PPO}}(\theta)$ via Eq.~(29)--(33)
+    \State Decrement $T_j^Q\ \forall\, u_j \in U^Q$; restore $u_j \to U^A$ if $T_j^Q = 0$
+\EndFor
+\State \textbf{return} $\{a_j^{(t)}\}$, $\{M_{c_k}^{(T)}\}$
+\end{algorithmic}
+\end{algorithm}
+
+The observable parameters that the agent relies on include - the contamination score, the contamination flag count, and the reputation of the UAV. An observation vector \eqref{eq:obs_vector} is formed with the given parameters which is used directly in the proposed RL algorithm to make decisions about the state of the UAV.
+
+\begin{equation}\label{eq:obs_vector}
+o_j^{(t)}
+=
+(\lambda_j^{(t)}, q_j^{(t)}, \rho_j^{(t)})
+\end{equation}
+
+We employ Proximal Policy Optimization (PPO) \cite{ppo} as the RL algorithm to find the policy for the current observation space, it is an algorithm that improves training stability by clipping the update size if the magnitude of the update is beyond a defined threshold \eqref{eq:loss_clip}, this prevents excessively large policy changes caused by a an outlier.
+
+\begin{align}\label{eq:loss_clip}
+L^{CLIP (t)}(\theta)
+&=
+\mathbb{E}^t[
+min(\nu^t(\theta) A^t,
+\\ 
+&\quad \nonumber
+clip(\nu^t(\theta),
+1-\epsilon,
+1+\epsilon
+)A^t
+)
+]
+\\
+\nu^t(\theta)
+&=
+\frac
+ {\pi_\theta(a_j^{(t)}|o_j^{(t)})}
+ {\pi_{\theta_{old}}(a_j^{(t)}|o_j^{(t)})}
+ \\ \nonumber
+\end{align}
+
+The system is designed around the discrete action space ($A$) \eqref{eq:action_space} that can drastically change the involvement of a UAV for the rounds to come.
+The actor \eqref{eq:actor} and critic \eqref{eq:critic} are based off of the same neural network, where $\theta$ is used to denote set of it's parameters.
+
+\begin{equation}\label{eq:action_space}
+a_j^{t} \in A 
+= 
+\{Allow, Quarantine, Exclude\}
+\end{equation}
+
+The actions taken result in the displacement of UAVs among the available sets of edge UAVs. If a UAV is detected as contaminating, it is moved to the set of quarantined UAVs $U^Q$, and if it is detected as malicious it is moved to the set of excluded UAVs $U^E$.
+
+\begin{equation}\label{eq:actor}
+ \pi_\theta(a_j^{(t)}|o_j^{(t)})
+\end{equation}
+
+
+\begin{equation}\label{eq:critic}
+V_\theta(o_j^{(t)})
+\end{equation}
+
+The objective of the RL agent is to maximize the model reliability by mitigating the affect of contamination in the future and to minimize the influence of malicious UAVs on the federated learning process. Therefore, the reward function \eqref{eq:reward} is designed to promote the reliable UAVs and penalize the UAVs with a history of contaminating features.
+
+\begin{align}\label{eq:reward}
+R_j^{(t+1)} &=
+\rho_j^{(t)} + \Delta \psi_j^{(t)} + \Lambda(a)\\
+\Lambda(a) &=
+\begin{cases}
+0, & a=\textsc{Allow} \\
+- T_j^{Q(t)}, & a=\textsc{Quarantine} \\
+- (1-\lambda_j^{(t)})\log(1+E_j^{ret(t)}), & a=\textsc{Exclude}
+\end{cases}
+\end{align}
+
+In the above equation, reputation ($\rho$) represents the historical reliability of the UAV, whereas $\Delta \psi^{(t)}_j$ represents the change in the validation accuracy for the coalition aggregated by fog UAV $h_k$ resulting from the action applied to edge UAV $u_j$.
+The term $\lambda_j \log(1 + E_j^{ret (t)})$ incorporates the retraining energy cost required to remove the UAV and the logarithmic transformation scales it enough so that the retraining energy doesn't dominate the reward signal, enabling a malicious UAV for staying in the aggregation process on the account of the burden on their coalition.
+Finally, $T_j^{Q(t)}$ represents the quarantine duration assigned to UAV $u_j$ \eqref{eq:quarantine}, i.e. the amount of rounds for which edge UAV $u_j$ is isolated from the aggregation process.
+
+\begin{equation}\label{eq:quarantine}
+T_j^Q
+=
+\left\lfloor
+\frac{e^{(\tau q_j)}}{1 + \rho_j}
+\right\rfloor
+\end{equation}
+
+\begin{propo}[Rejoining Policy Monotonicity]
+Let $u_j \in U^Q$ be a quarantined UAV with 
+contamination flag count $q_j$ and reputation $\rho_j$. 
+The quarantine duration $T_j^Q$ is monotonically increasing 
+in $q_j$ and monotonically decreasing in $\rho_j$, ensuring 
+that UAVs with a higher history of contamination are isolated 
+for longer periods while UAVs with stronger historical 
+reliability recover faster.
+\end{propo}
+
+\begin{proof}
+The quarantine duration is given by \eqref{eq:quarantine}:
+\[
+T_j^Q = \left\lfloor \frac{e^{\tau q_j}}{1 + \rho_j} \right\rfloor
+\]
+Treating $T_j^Q$ as continuous and differentiating with 
+respect to $q_j$:
+\[
+\frac{\partial T_j^Q}{\partial q_j} 
+= \frac{\tau e^{\tau q_j}}{1 + \rho_j} > 0
+\]
+since $\tau > 0$ and $e^{\tau q_j} > 0$ for all $q_j$. 
+Hence $T_j^Q$ is strictly increasing in $q_j$.
+Differentiating with respect to $\rho_j$:
+\[
+\frac{\partial T_j^Q}{\partial \rho_j} 
+= -\frac{e^{\tau q_j}}{(1 + \rho_j)^2} < 0
+\]
+since $e^{\tau q_j} > 0$ and $(1+\rho_j)^2 > 0$ for all 
+$\rho_j > -1$. Hence $T_j^Q$ is strictly decreasing 
+in $\rho_j$.
+\end{proof}
+
+To learn an effective contamination detection policy, PPO optimizes the loss function \eqref{eq:loss_ppo} on the basis of the reward function \eqref{eq:reward}. The objective function combines the clipped loss function \eqref{eq:loss_clip}, value loss function \eqref{eq:loss_val}, and entropy based exploration \eqref{eq:entropy}.
+
+\begin{equation}\label{eq:loss_ppo}
+L^{PPO (t)}(\theta)
+=
+\mathbb{E}^t[
+L^{CLIP (t)}(\theta) -
+l_1 L^{VF (t)}(\theta) -
+l_2 \omega[\pi_\theta](o_j^{(t)})
+]
+\end{equation}
+
+The value loss function \eqref{eq:loss_val} minimizes the error between the predicted value and the observed return, this enables the critic to make better long term decision, which in turn improves the actor's decision and as a result the overall performance of the RL model. The value loss function uses advantage \eqref{eq:advantage} to compute the relative benefit of using the chosen action over the others by using the mean value for that state.
+
+\begin{align}\label{eq:loss_val}
+L^{VF (t)}(\theta)
+&=
+(
+V_\theta(o^{(t)}) -
+V^{tar (t)}
+)^2
+\\
+V^{tar (t)}
+&=
+A^{(t)} +
+V_{\theta_{old}}(o^{(t)})
+\end{align}
+
+\begin{equation}\label{eq:advantage}
+A(o_j^{(t)}, a_j^{(t)}) 
+=
+R_j^{(t)} +
+\gamma V(o_j^{(t+1)}) - V(o_j^{(t)})
+\end{equation}
+
+The entropy bonus term \eqref{eq:entropy} is used promote exploration in the model, discouraging premature convergence, this plays a crucial role in the early stages of training where the agent must explore different contamination detection strategies.
+
+\begin{equation}\label{eq:entropy}
+\omega[\pi_\theta](o^{(t)}) 
+=
+-\sum_a 
+\pi_\theta(a_j^{(t)}|o_j^{(t)})
+log(\pi_\theta(a_j^{(t)}|o_j^{(t)}))
+\end{equation}
+
+The entropy bonus term motivates the model to explore among the possible actions - Allow, Quarantine, and Exclude. Whereas, the value loss function trains the critic to better estimate the future consequences of the contamination detection actions taken.
+
+
+\subsection{Post-Detection Recovery Mechanism}
+Detection and isolation of edge UAVs does not eliminate the influence of contaminated updates already incorporated in the system. These UAVs are segregated into different states by the RL model, if the UAV is chosen to be excluded, it is removed from the system completely and the checkpoint based unlearning method is triggered. 
+
+If a UAV is chosen to be quarantined, it is removed from the system for a fixed amount of time which depends on the amount of times it has been flagged and it's reputation. This allows the UAV to attempt to participate again in the near future, which enables the UAVs to recover from false alarms and increase the network participation. These UAVs are allowed to participate after it's quarantine period. If it is categorized as contaminating again by the RL model, it is quarantined for a longer time and if it is categorized as malicious UAV it is permanently excluded from the system.
+
+\begin{algorithm}[t]
+\caption{Checkpoint-Based Recovery and Model Reconstruction}
+\label{alg:checkpoint_recovery}
+\begin{algorithmic}[1]
+\Statex \textbf{Input:} Coalition set $\mathcal{C}$, Fog UAVs $\mathcal{H}$, Edge UAVs $\mathcal{U}$, threshold $\kappa_{th}$
+\Statex \textbf{Output:} Restored coalition and global models
+
+\State Initialize $t_c \leftarrow 0$,\ $\mathcal{M}_{ckpt} \leftarrow \emptyset$
+
+\For{$t = 1$ \textbf{to} $T$}
+    \State Compute $\kappa \leftarrow (t - t_c)\sum_{c_k \in \mathcal{C}}\sum_{u_j \in c_k} \lambda_j^{(t)} q_j^{(t)}$ \Comment{Checkpoint urgency}
+    \If{$\kappa \geq \kappa_{th}$}\ \ store $\{M_{c_k}^{(t)}\}$ in $\mathcal{M}_{ckpt}$;\ $t_c \leftarrow t$
+    \EndIf
+
+    \If{\textbf{any} $u_j$ is \textsc{Excluded}} \Comment{Recovery}
+        \State Restore $M_{c_k} \leftarrow M_{c_k}^{(t_c)}\ \forall\, c_k \in \mathcal{C}$
+        \State Reconstruct $M^{(t_c)} \leftarrow \mathrm{Aggregate}\!\left(\{M_{c_k}^{(t_c)}\}_{c_k \in \mathcal{C}}\right)$; distribute to all UAVs
+    \EndIf
+
+    \For{\textbf{each} $u_j \in \mathcal{U}^Q$ with $T_j^Q = 0$} \Comment{Quarantine expiry}
+        \State Send $M^{(t)}$ to $u_j$;\ move $u_j \to U^A$
+    \EndFor
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+
+For the removal of the effects of contamination, exact unlearning practice would be to completely re-train the edge UAVs from scratch, excluding the the contaminating UAV from the process to gain a model rid of any influence from the identified UAV. This is extremely costly because of the retraining energy required which would be amplified if multiple UAVs are removed.
+
+Therefore, we propose a lightweight checkpoint based recovery mechanism which avoids the excessive cost of retraining UAVs from scratch and the storage overhead associated with storing the models by using a trigger based system \eqref{eq:checkpoint_urgency} , which evaluates the need to store the models of every fog UAV in the system, where $t_c$ denotes the last checkpoint round. This metric increase with increase in the contamination detection, making it reactive to the current environment, and  determine the likelihood of checkpoint creation.
+
+\begin{equation}\label{eq:checkpoint_urgency}
+\kappa 
+= 
+(t - t_c)
+\sum_{k = 1}^{|C|}\sum_{j=1}^{|c_k|}
+\lambda_j
+q_j
+\end{equation}
+
+When this value passes a certain threshold $\kappa_{th}$, which is a design choice on the basis of tolerable exposure, the models for every fog UAV in the system are saved ($M_{ckpt}$).
+
+\begin{equation}\label{eq:checkpoint_trigger}
+\text{Checkpoint Creation}
+=
+\begin{cases}
+1, & \kappa \geq \kappa_{th}\\
+0, & \text{otherwise}
+\end{cases}
+\end{equation}
+
+
+\begin{theorem}[Bounded Contamination Exposure Before Recovery]
+Let $u_j \in c_k$ be an edge UAV detected as malicious at round $t^*$, and let $t_c$ be the latest trusted checkpoint round such that $t_c < t^*$. After rolling back the coalition model to $M_{c_k}^{(t_c)}$, the residual contamination in the restored model is bounded by the cumulative gradient 
+influence of $u_j$ over at most $(t^* - t_c)$ rounds:
+\[
+\left\| M_{c_k}^{(t^*)} - M_{c_k}^{(t_c)} \right\| 
+\leq 
+(t^* - t_c) \cdot \max_{r \in [t_c,\, t^*]} 
+\frac{n_j}{N_k} \left\| g_j^{(r)} \right\|
+\]
+\end{theorem}
+
+
+\begin{proof}
+From \eqref{eq:fog_agg}, the coalition model evolves 
+through successive gradient aggregations. The difference 
+between the model at detection round $t^*$ and the 
+checkpointed model at $t_c$ can be expressed as:
+\[
+M_{c_k}^{(t^*)} - M_{c_k}^{(t_c)} 
+= \sum_{r=t_c+1}^{t^*} \sum_{u_i \in c_k^{(r)}} 
+\frac{n_i}{N_k} g_i^{(r)}
+\]
+Isolating the contribution of $u_j$ from the remaining 
+clean UAVs $c_k^{(r)} \setminus \{u_j\}$:
+
+\[
+M_{c_k}^{(t^*)} - M_{c_k}^{(t_c)} 
+= \sum_{r=t_c+1}^{t^*} \frac{n_j}{N_k} g_j^{(r)}
++ \sum_{r=t_c+1}^{t^*} \sum_{u_i \in c_k^{(r)} \setminus \{u_j\}} 
+\frac{n_i}{N_k} g_i^{(r)}
+\]
+
+Taking the norm and applying the triangle inequality:
+
+\[
+\begin{aligned}
+\left\| M_{c_k}^{(t^*)} - M_{c_k}^{(t_c)} \right\|
+\leq\;&
+\underbrace{
+\sum_{r=t_c+1}^{t^*} \frac{n_j}{N_k} \left\| g_j^{(r)} \right\|
+}_{\text{Updates by malicious UAVs}}
+\\
+&+
+\underbrace{
+\sum_{r=t_c+1}^{t^*} \sum_{u_i \in c_k^{(r)} \setminus \{u_j\}}
+\frac{n_i}{N_k} \left\| g_i^{(r)} \right\|
+}_{\text{Updates by non-malicious UAVs}}
+\end{aligned}
+\]
+
+The second summation corresponds to updates contributed by non-malicious UAVs and therefore does not constitute contamination. Consequently, only the first summation is considered when bounding the contamination attributable to $u_j$.
+\[
+\sum_{r=t_c+1}^{t^*} \frac{n_j}{N_k} \left\| g_j^{(r)} \right\|
+\leq 
+(t^* - t_c) \cdot \max_{r \in [t_c,\, t^*]} 
+\frac{n_j}{N_k} \left\| g_j^{(r)} \right\|
+\]
+Hence, the residual contamination in $M_{c_k}^{(t_c)}$ 
+after rollback is bounded above by $(t^* - t_c)$ times 
+the maximum per-round gradient influence of $u_j$, 
+confirming that a tighter checkpoint interval directly 
+reduces the worst-case contamination exposure.
+\end{proof}
+
+
+After a malicious UAV is detected in the system and it is chosen to be permanently excluded from aggregation, the models of every fog UAV are rolled back to the model stored at the last checkpoint, these UAVs then send their data to the base station for aggregation, which then sends back the updated models to every fog UAV and active UAV in the system.
+
+In the case that a UAV attempts to rejoin the system after it's quarantine period, it receives the latest global model and attempts to participate in the system with it and the contamination detection model runs again, followed by the PPO framework, which then decides the status of the given UAV.
+
+%
+%
+%
+\section{Result and Discussions}
+Provide adequate results and include the discussion on the same.
+
+%
+%
+%
+\section{Conclusion}
+What is the overall idea of your work, methodology, and observation.
+
+\bibliographystyle{IEEEtran}
+\bibliography{reference}
+
+\end{document}

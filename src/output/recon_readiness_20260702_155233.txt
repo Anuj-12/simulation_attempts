@@ -1,0 +1,45 @@
+========================================================================
+ReCon HFL — SYSTEM READINESS REPORT
+========================================================================
+Generated : 2026-07-02T15:52:33
+Mode      : recovery
+Detector  : flguardian (φ)
+Malicious : u5
+Verdict   : READY (5/5 checks passed)
+
+READINESS CHECKS
+------------------------------------------------------------------------
+  [PASS] Round history captured
+         8 rounds logged
+  [PASS] FLGuardian flags malicious UAV (λ)
+         Malicious UAV λ exceeded benign minimum by >0.05 in at least one round
+  [PASS] PPO quarantine/exclude on threat
+         Malicious UAV received QUARANTINE or EXCLUDE
+  [PASS] Global model trains
+         Accuracy 0.4389 → 0.1000
+  [PASS] Recovery subsystem engaged
+         checkpoint t_c=3, max excluded=4
+
+ROUND SUMMARY
+------------------------------------------------------------------------
+ Rnd      Acc  Active   Q  Ex  Notable UAV actions
+------------------------------------------------------------------------
+   1   0.4389       3   2   0  u1:λ=1.00→QUA, u4:λ=0.00→QUA, u5:λ=1.00→ALL
+   2   0.1068       2   0   3  u1:λ=0.50→ALL, u2:λ=0.50→EXC, u3:λ=0.50→EXC, u4:λ=0.50→ALL, u5:λ=0.50→EXC
+   3   0.1068       1   0   4  u1:λ=0.02→EXC, u2:λ=0.50→ALL, u3:λ=0.50→ALL, u5:λ=0.50→ALL
+   4   0.1000       0   1   4  u2:λ=0.50→ALL, u3:λ=0.50→ALL, u4:λ=0.00→QUA, u5:λ=0.50→ALL
+   5   0.1000       0   1   4  u2:λ=0.50→ALL, u3:λ=0.50→ALL, u5:λ=0.50→ALL
+   6   0.1000       0   1   4  u2:λ=0.50→ALL, u3:λ=0.50→ALL, u5:λ=0.50→ALL
+   7   0.1000       1   0   4  u2:λ=0.50→ALL, u3:λ=0.50→ALL, u5:λ=0.50→ALL
+   8   0.1000       1   0   4  u2:λ=0.50→ALL, u3:λ=0.50→ALL, u5:λ=0.50→ALL
+
+PER-UAV FINAL STATE
+------------------------------------------------------------------------
+UAV    Coal       λ       ρ   q State        Action     Mal?
+------------------------------------------------------------------------
+u1     c1     0.022   0.894   1 EXCLUDED     ALLOW      no
+u2     c1     0.500   0.898   0 EXCLUDED     ALLOW      no
+u3     c1     0.500   0.954   0 EXCLUDED     ALLOW      no
+u4     c1     0.000   0.971   2 ACTIVE       ALLOW      no
+u5     c1     0.500   0.893   0 EXCLUDED     ALLOW      yes
+========================================================================

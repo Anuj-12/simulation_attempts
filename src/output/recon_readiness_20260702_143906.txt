@@ -1,0 +1,45 @@
+========================================================================
+ReCon HFL — SYSTEM READINESS REPORT
+========================================================================
+Generated : 2026-07-02T14:39:06
+Mode      : recovery
+Detector  : flguardian (φ)
+Malicious : u5
+Verdict   : NEEDS ATTENTION (4/5 checks passed)
+
+READINESS CHECKS
+------------------------------------------------------------------------
+  [PASS] Round history captured
+         8 rounds logged
+  [FAIL] FLGuardian flags malicious UAV (λ)
+         Could not distinguish malicious UAV by contamination score
+  [PASS] PPO quarantine/exclude on threat
+         Malicious UAV received QUARANTINE or EXCLUDE
+  [PASS] Global model trains
+         Accuracy 0.1000 → 0.1000
+  [PASS] Recovery subsystem engaged
+         checkpoint t_c=0, max excluded=5
+
+ROUND SUMMARY
+------------------------------------------------------------------------
+ Rnd      Acc  Active   Q  Ex  Notable UAV actions
+------------------------------------------------------------------------
+   1   0.1000       3   0   2  u1:λ=0.00→EXC, u2:λ=0.00→EXC, u5:λ=0.00→ALL
+   2   0.1000       2   0   3  u5:λ=0.00→EXC
+   3   0.1000       0   0   5  u3:λ=0.00→EXC, u4:λ=0.00→EXC, u5:λ=0.00→ALL
+   4   0.1000       0   0   5  u5:λ=0.00→ALL
+   5   0.1000       0   0   5  u5:λ=0.00→ALL
+   6   0.1000       0   0   5  u5:λ=0.00→ALL
+   7   0.1000       0   0   5  u5:λ=0.00→ALL
+   8   0.1000       0   0   5  u5:λ=0.00→ALL
+
+PER-UAV FINAL STATE
+------------------------------------------------------------------------
+UAV    Coal       λ       ρ   q State        Action     Mal?
+------------------------------------------------------------------------
+u1     c1     0.000   0.501   0 EXCLUDED     ALLOW      no
+u2     c1     0.000   0.502   0 EXCLUDED     ALLOW      no
+u3     c1     0.000   0.573   0 EXCLUDED     ALLOW      no
+u4     c1     0.000   0.561   0 EXCLUDED     ALLOW      no
+u5     c1     0.000   0.506   0 EXCLUDED     ALLOW      yes
+========================================================================
