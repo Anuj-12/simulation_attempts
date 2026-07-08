@@ -141,6 +141,14 @@ def parse_args() -> argparse.Namespace:
         "--rounds itself - e.g. 0.10 means round 10 on a 100-round run but round 100 "
         "on a 1000-round run. Ignored if --no-flag-reset is set.",
     )
+    parser.add_argument(
+        "--no-quarantine-release",
+        action="store_true",
+        help="Disable releasing every currently-QUARANTINED UAV back to ACTIVE at "
+        "the same primer-end event as the q reset (default: released). Does not "
+        "affect EXCLUDED UAVs, which remain terminal. Ignored if --no-flag-reset "
+        "is set, since this fires at the same event.",
+    )
     parser.add_argument("--rounds", type=int, default=100, help="Number of FL rounds")
     parser.add_argument("--local-epochs", type=int, default=1, help="Local epochs per round")
     parser.add_argument("--batch-size", type=int, default=64, help="Training batch size")
@@ -173,12 +181,14 @@ def make_hfl_config(args: argparse.Namespace) -> HFLConfig:
 
 
 def make_rl_config(args: argparse.Namespace) -> RLConfig:
-    """Only overrides the flag-reset fields from CLI args; everything else
-    (reputation_lr, entropy_coef, exclude_warmup_fraction, etc.) still uses
-    RLConfig's dataclass defaults, unchanged by this function."""
+    """Only overrides the flag-reset/quarantine-release fields from CLI args;
+    everything else (reputation_lr, entropy_coef, exclude_warmup_fraction,
+    etc.) still uses RLConfig's dataclass defaults, unchanged by this
+    function."""
     return RLConfig(
         reset_flags_after_primer=not args.no_flag_reset,
         flag_reset_fraction=args.flag_reset_fraction,
+        release_quarantine_after_primer=not args.no_quarantine_release,
     )
 
 
@@ -426,4 +436,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main()   main()

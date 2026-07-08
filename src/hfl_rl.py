@@ -186,6 +186,18 @@ class RLConfig:
     # a longer/shorter primer for this specific mitigation.
     flag_reset_fraction: float = 0.10
 
+    # At the same primer-end event as the q reset above, also force every
+    # currently QUARANTINED UAV back to ACTIVE (participation reset,
+    # quarantine_rounds_remaining zeroed, given the current global model
+    # weights - same as a normal tick_quarantine()-triggered rejoin).
+    # Also NOT in the paper. Rationale: resetting q alone still leaves any
+    # UAV mid-quarantine serving out a (possibly inflated, pre-reset) T_j^Q
+    # sentence computed under the near-random primer-period policy; this
+    # clears that sentence too, so nothing from the primer period's
+    # exploration noise carries into the rest of the run. Does NOT affect
+    # EXCLUDED UAVs - exclude remains a terminal state, per Algorithm 1.
+    release_quarantine_after_primer: bool = True
+
 
 # ---------------------------------------------------------------------------
 # RL-enriched edge UAV
@@ -223,12 +235,37 @@ class RLEdgeUAV(EdgeUAV):
                 param.data.copy_(ref + delta * self.poison_scale)
 
     def observation(self) -> torch.Tensor:
-        """o_j = (lambda_j, q_j, rho_j)  (Eq. 20)."""
+        """o_j = (lambda_j, q_j, rho_j)  (Eq. 20).
+
+        Defensive guard (not part of the paper): sanitizes non-finite
+        (NaN/+-Inf) values before they can reach the PPO network. This can
+        happen if the simulated system diverges numerically upstream (e.g.
+        unbounded global-model weight growth feeding into contamination
+        scoring or Eq. 7's arithmetic) - Python's built-in min/max do NOT
+        reliably clamp NaN regardless of argument order (e.g.
+        max(min(nan, 10.0), 0.0) can still evaluate to nan), so
+        update_reputation's own clamp is not a guaranteed backstop. A NaN
+        reaching Categorical(logits=...) crashes the run; worse, if it
+        reaches PPOAgent.update() it can permanently corrupt the network's
+        weights (see that method's own guard). contamination_score defaults
+        to 1.0 (maximally suspicious), not 0.0, on a non-finite read:
+        failing open toward "assume innocent" is exactly the failure mode
+        already diagnosed elsewhere (a coalition collapsed to a single
+        active UAV silently reads as fully clean) - failing closed toward
+        "assume contaminated" is the safer default here. reputation defaults
+        to initial_reputation's value (0.5) as a neutral fallback.
+        """
+        lam = self.contamination_score
+        if not math.isfinite(lam):
+            lam = 1.0
+        rho = self.reputation
+        if not math.isfinite(rho):
+            rho = 0.5
         return torch.tensor(
             [
-                self.contamination_score,
+                lam,
                 float(self.flag_count) / 5.0,
-                self.reputation / 10.0,
+                rho / 10.0,
             ],
             dtype=torch.float32,
         )
@@ -513,7 +550,22 @@ class PPOAgent:
         return returns_t, advantages
 
     def update(self) -> Dict[str, float]:
-        """Optimize L_PPO = L_CLIP - l1 * L_VF - l2 * entropy  (Eq. 29)."""
+        """Optimize L_PPO = L_CLIP - l1 * L_VF - l2 * entropy  (Eq. 29).
+
+        Defensive guard (not part of the paper): if the observations, returns,
+        or advantages collected this round contain any non-finite value (NaN
+        or +/-Inf) - which can happen upstream if the simulated system itself
+        diverges numerically (e.g. unbounded global-model weight growth from
+        repeated poisoned aggregation) - skip this update entirely rather
+        than let torch.optim apply a NaN/Inf gradient. Once a network
+        parameter becomes NaN, every subsequent forward pass through it is
+        NaN forever (NaN self-propagates through all arithmetic) - there is
+        no recovering from it later, so the only safe response is to never
+        let a bad update reach optimizer.step() in the first place. This
+        does not fix whatever caused the non-finite values upstream; it only
+        prevents that upstream problem from also permanently destroying the
+        policy network.
+        """
         if not self.buffer:
             return {}
 
@@ -521,6 +573,22 @@ class PPOAgent:
         actions = torch.tensor([t.action for t in self.buffer], device=self.device)
         old_log_probs = torch.tensor([t.log_prob for t in self.buffer], device=self.device)
         returns, advantages = self._compute_returns()
+
+        if not (
+            torch.isfinite(obs).all()
+            and torch.isfinite(old_log_probs).all()
+            and torch.isfinite(returns).all()
+            and torch.isfinite(advantages).all()
+        ):
+            print(
+                "[PPO WARNING] Non-finite value in this round's transitions "
+                "(obs/log_prob/return/advantage) - skipping this PPOAgent.update() "
+                "call entirely to avoid corrupting the policy network with a "
+                "NaN/Inf gradient. This does not fix the underlying numerical "
+                "issue upstream (likely diverged global-model weights)."
+            )
+            self.clear_buffer()
+            return {}
 
         clip_stats: Dict[str, float] = {}
         for _ in range(self.config.ppo_epochs):
@@ -540,6 +608,14 @@ class PPOAgent:
                 + self.config.value_coef * value_loss
                 - self.config.entropy_coef * entropy
             )
+
+            if not torch.isfinite(loss):
+                print(
+                    f"[PPO WARNING] Non-finite loss ({float(loss)!r}) this epoch - "
+                    "skipping optimizer.step() for this epoch only, network weights "
+                    "left unchanged."
+                )
+                continue
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -984,28 +1060,41 @@ class HFLRLStation(BaseStation):
         return meta
 
     def _maybe_reset_flags(self, round_idx: int) -> bool:
-        """One-time q (flag_count) reset once the primer period ends.
+        """One-time q (flag_count) reset, and optionally quarantine release,
+        once the primer period ends.
 
-        See RLConfig.reset_flags_after_primer/flag_reset_fraction for the
-        rationale (mitigating early-exploration quarantine flags compounding
-        via Eq. 28's exponential T_j^Q for the rest of the run). Fires at
-        most once per run() call, at round self._flag_reset_round. Resets
-        every RLEdgeUAV's flag_count regardless of current participation
-        state (harmless no-op for EXCLUDED UAVs, since they never re-enter
-        the decision loop anyway; meaningful for ACTIVE and QUARANTINED
-        UAVs since a future quarantine's Eq. 28 duration will use the reset
-        q going forward).
+        See RLConfig.reset_flags_after_primer/flag_reset_fraction/
+        release_quarantine_after_primer for the rationale (mitigating
+        early-exploration quarantine flags - and the sentences computed
+        from them - compounding via Eq. 28's exponential T_j^Q for the rest
+        of the run). Fires at most once per run() call, at round
+        self._flag_reset_round. The q reset applies to every RLEdgeUAV
+        regardless of current participation state (harmless no-op for
+        EXCLUDED UAVs, since they never re-enter the decision loop anyway).
+        The quarantine release only ever applies to currently QUARANTINED
+        UAVs - EXCLUDED remains terminal, untouched here, per Algorithm 1.
         """
         if not self.rl_config.reset_flags_after_primer or self._flags_reset_done:
             return False
         if round_idx < self._flag_reset_round:
             return False
+
         for uav in self.rl_edge_uavs:
             uav.flag_count = 0
+
+        released = []
+        if self.rl_config.release_quarantine_after_primer:
+            for uav in self.quarantined_uavs:
+                uav.participation = ParticipationState.ACTIVE
+                uav.quarantine_rounds_remaining = 0
+                uav.load_state_dict(self.global_model.state_dict())
+                released.append(uav.uav_id)
+
         self._flags_reset_done = True
         print(
             f"[Flag Reset] q reset to 0 for all {len(self.rl_edge_uavs)} UAVs "
             f"at round {round_idx} (primer period ended)"
+            + (f"; released from quarantine: {released}" if released else "")
         )
         return True
 
