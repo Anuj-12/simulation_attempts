@@ -6,13 +6,16 @@ Dependency graph (acyclic):
                       ^            ^               ^
                       |            |               |
                  flguardian_det ----+---------------+
+                      |             |
+                   fltrust ---------+
                       |
                       +----------- main -----------+
 
 ReCon pipeline (ReCon.tex):
-  Edge UAVs train locally -> Fog runs FLGuardian (φ) -> reputation update
-  -> PPO {Allow, Quarantine, Exclude} -> hierarchical aggregation
-  -> checkpoint rollback on Exclude (recovery mode)
+  Edge UAVs train locally -> Fog runs contamination detection (phi -
+  FLGuardian or FLTrust, both black-box per ReCon.tex line 180) ->
+  reputation update -> PPO {Allow, Quarantine, Exclude} -> hierarchical
+  aggregation -> checkpoint rollback on Exclude (recovery mode)
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ import argparse
 from typing import List, Sequence, Tuple
 
 from flguardian_det import build_flguardian_hfl_adapter
+from fltrust import build_fltrust_hfl_adapter
 from hfl_base import build_hfl_system
 from hfl_common import HFLConfig, load_fashion_mnist
 from hfl_recovery import RecoveryConfig, build_hfl_recovery_system
@@ -63,7 +67,8 @@ DEFAULT_MALICIOUS: List[str] = [
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="ReCon: reputation-aware HFL with FLGuardian contamination detection"
+        description="ReCon: reputation-aware HFL with pluggable contamination detection "
+        "(FLGuardian or FLTrust, per ReCon.tex's phi black-box interface)"
     )
     parser.add_argument(
         "--mode",
@@ -77,9 +82,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--detector",
-        choices=["flguardian", "none"],
+        choices=["flguardian", "fltrust", "none"],
         default="flguardian",
-        help="Contamination detector φ (default: flguardian)",
+        help="Contamination detector φ (default: flguardian). Both flguardian and "
+        "fltrust are drop-in per ReCon.tex line 180 ('φ is essentially a black box').",
+    )
+    parser.add_argument(
+        "--fltrust-root-size",
+        type=int,
+        default=100,
+        help="|D0|: size of FLTrust's server-held root dataset (default: 100, "
+        "the paper's default across all evaluated datasets, Table I). Only used "
+        "when --detector fltrust.",
+    )
+    parser.add_argument(
+        "--fltrust-no-magnitude-signal",
+        action="store_true",
+        help="Use FLTrust's literal Eq. 2 trust score only (1 - ReLU(cosine)) with "
+        "no magnitude-penalty term. Default (off) adds a magnitude-deviation signal "
+        "since ReCon's poisoning attack (apply_poison) is a pure magnitude scaling "
+        "of an otherwise-honest gradient, which a direction-only cosine trust score "
+        "is blind to by construction - see fltrust.py's FLTrustDetector docstring. "
+        "Only used when --detector fltrust.",
     )
     parser.add_argument(
         "--malicious",
@@ -99,6 +123,23 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=2.0,
         help="κ_th: urgency score for checkpoint creation (default: 2.0)",
+    )
+    parser.add_argument(
+        "--no-flag-reset",
+        action="store_true",
+        help="Disable the one-time q (flag_count) reset that otherwise fires once, "
+        "after the primer period, wiping every UAV's accumulated quarantine flags. "
+        "Off by default means falling back to the paper's literal never-decreasing "
+        "q_j (Eq. 7/28 have no reset term).",
+    )
+    parser.add_argument(
+        "--flag-reset-fraction",
+        type=float,
+        default=0.10,
+        help="Fraction of --rounds treated as the primer period before the one-time "
+        "q reset fires (default: 0.10, i.e. 10%% of the run). Independent of "
+        "--rounds itself - e.g. 0.10 means round 10 on a 100-round run but round 100 "
+        "on a 1000-round run. Ignored if --no-flag-reset is set.",
     )
     parser.add_argument("--rounds", type=int, default=100, help="Number of FL rounds")
     parser.add_argument("--local-epochs", type=int, default=1, help="Local epochs per round")
@@ -131,9 +172,29 @@ def make_hfl_config(args: argparse.Namespace) -> HFLConfig:
     )
 
 
-def make_contamination_detector(args: argparse.Namespace):
+def make_rl_config(args: argparse.Namespace) -> RLConfig:
+    """Only overrides the flag-reset fields from CLI args; everything else
+    (reputation_lr, entropy_coef, exclude_warmup_fraction, etc.) still uses
+    RLConfig's dataclass defaults, unchanged by this function."""
+    return RLConfig(
+        reset_flags_after_primer=not args.no_flag_reset,
+        flag_reset_fraction=args.flag_reset_fraction,
+    )
+
+
+def make_contamination_detector(args: argparse.Namespace, config: HFLConfig):
     if args.detector == "none":
         return zero_contamination_detector
+    if args.detector == "fltrust":
+        # Passing `config` (not just device) so the server's root-dataset
+        # training uses the same batch_size/lr/local_epochs as the edge UAVs
+        # (Algorithm 2 uses the same b, beta, Rl for clients and server) -
+        # see build_fltrust_hfl_adapter's docstring in fltrust.py.
+        return build_fltrust_hfl_adapter(
+            config=config,
+            root_size=args.fltrust_root_size,
+            include_magnitude_signal=not args.fltrust_no_magnitude_signal,
+        )
     return build_flguardian_hfl_adapter(device=args.device)
 
 
@@ -153,7 +214,7 @@ def run_rl_mode(
     poison_scale: float,
     rl_config: RLConfig | None = None,
 ) -> HFLRLStation:
-    print("Running HFL with PPO-based UAV state management + FLGuardian φ")
+    print("Running HFL with PPO-based UAV state management + contamination detection (φ)")
     station = build_hfl_rl_system(
         coalitions,
         config=config,
@@ -176,7 +237,7 @@ def run_recovery_mode(
     rl_config: RLConfig | None = None,
     recovery_config: RecoveryConfig | None = None,
 ):
-    print("Running full ReCon: FLGuardian φ + PPO governance + checkpoint recovery")
+    print("Running full ReCon: contamination detection (φ) + PPO governance + checkpoint recovery")
     station = build_hfl_recovery_system(
         coalitions,
         config=config,
@@ -321,7 +382,8 @@ def print_simulation_summary(
 def main() -> None:
     args = parse_args()
     config = make_hfl_config(args)
-    detector = make_contamination_detector(args)
+    rl_config = make_rl_config(args)
+    detector = make_contamination_detector(args, config)
     malicious = args.malicious if args.mode != "base" else []
 
     print("=" * 72)
@@ -338,7 +400,8 @@ def main() -> None:
         station = run_base_mode(config, DEFAULT_COALITIONS)
     elif args.mode == "rl":
         station = run_rl_mode(
-            config, DEFAULT_COALITIONS, detector, malicious, args.poison_scale
+            config, DEFAULT_COALITIONS, detector, malicious, args.poison_scale,
+            rl_config=rl_config,
         )
     else:
         recovery_config = RecoveryConfig(checkpoint_threshold=args.checkpoint_threshold)
@@ -348,6 +411,7 @@ def main() -> None:
             detector,
             malicious,
             args.poison_scale,
+            rl_config=rl_config,
             recovery_config=recovery_config,
         )
 

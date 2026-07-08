@@ -82,7 +82,19 @@ class RLConfig:
     """Hyper-parameters for reputation and PPO (ReCon Sec. 4.1-4.2)."""
 
     initial_reputation: float = 0.5          # rho_0
-    reputation_lr: float = 0.1               # eta
+    # eta: raised from 0.1 to 0.35. At 0.1, ~50 rounds in, ρ for malicious
+    # (λ~1) and benign (λ~0) UAVs is still nearly indistinguishable (~0.50 for
+    # everyone), since the reward/penalty terms in Eq. 7 only move ρ a small
+    # amount per round. A faster eta separates the two populations sooner,
+    # which matters twice over: (1) it makes the Exclude penalty
+    # -(1-λ)*ρ actually discriminate earlier instead of being ~-0.5 for
+    # everyone regardless of contamination, and (2) it feeds back into
+    # T_j^Q = e^(τq)/(1+ρ) (Eq. 28) - a benign UAV whose ρ climbs faster gets
+    # shorter quarantines sooner even if flagged again, partially
+    # self-correcting the q-accumulation-during-warmup risk (q never decays,
+    # so early false-positive quarantines compound; faster ρ growth is a
+    # partial mitigation, not a fix for q itself never decreasing).
+    reputation_lr: float = 0.35              # eta
     penalty_tuning: float = 1.0              # tau
     initial_energy: float = 1000.0           # E_j^init (Eq. energy_res)
     default_contribution: float = 1.0        # phi_j fallback before first GTG-Shapley pass
@@ -105,9 +117,74 @@ class RLConfig:
     gamma: float = 0.99
     clip_epsilon: float = 0.2
     value_coef: float = 0.5                  # l1
-    entropy_coef: float = 0.01               # l2
+    # l2: raised from 0.01 to 0.08. At 0.01 the entropy bonus barely
+    # counteracts the policy settling into a locally-safe pattern (e.g.
+    # quarantining broadly) before the reward signal has had enough rounds to
+    # differentiate contamination levels - especially risky during the
+    # exclude_warmup_fraction window, where Exclude is unavailable and any
+    # early convergence toward over-quarantining has more rounds to
+    # compound q (which never decays) before Exclude even becomes an option.
+    # A higher coefficient keeps action selection noisier for longer,
+    # matching the paper's own stated intent for this term (line 617:
+    # "promote exploration... discouraging premature convergence") - see
+    # the entropy-sign note elsewhere in this file/the changes doc for the
+    # separate issue of the paper's literal equation contradicting that
+    # intent. Kept well under ~0.2, past which the entropy term risks
+    # dominating the loss and preventing convergence entirely.
+    entropy_coef: float = 0.08               # l2
     ppo_epochs: int = 4
     hidden_dim: int = 64
+
+    # Exclusion-unlock warm-up (implementation-level training-stability
+    # guard; NOT part of the paper's Algorithm 1 / Eq. 23 specification).
+    # EXCLUDE stays masked out of the PPO action space until at least this
+    # fraction of the run's total rounds have elapsed (see PPOAgent
+    # `exclude_unlocked`). Expressing it as a fraction rather than a fixed
+    # update count means the warm-up scales automatically with --rounds:
+    # "protect the first 10% of training" holds whether the run is 20
+    # rounds or 1000, whereas a fixed count of updates would be a 50%
+    # warm-up in a short run and a 1% warm-up in a long one.
+    #
+    # Default = 0.10. Each PPOAgent.update() call runs ppo_epochs (4)
+    # full-batch gradient steps over that round's collected transitions, so
+    # a 10% warm-up on the default 100-round horizon gives ~40 gradient
+    # steps and exposure to every active UAV's (lambda, q, rho) observation
+    # across 10 full rounds. Under the Eq. 28 quarantine-duration formula,
+    # T_Q is short for a first flag (q=1) with these defaults (~1-2 rounds),
+    # so that warm-up comfortably allows several QUARANTINE -> rejoin
+    # cycles to be observed and rewarded before the irreversible EXCLUDE
+    # action becomes available, while still leaving 90% of training with
+    # the full 3-action space.
+    exclude_warmup_fraction: float = 0.10
+
+    # Fallback used only if total_rounds is unavailable to PPOAgent at
+    # construction time (e.g. it's built standalone, without an HFLConfig).
+    # Not used when exclude_warmup_fraction can be resolved against an
+    # actual round count.
+    min_ppo_updates_before_exclude: int = 10
+
+    # One-time flag_count (q) reset after the "primer" period ends -
+    # implementation-level mitigation for a real risk, NOT in the paper.
+    # q only ever increases (assign_quarantine's self.flag_count += 1 is the
+    # only place that touches it anywhere in this file); Eq. 7/28 specify no
+    # decay or reset for q_j at all. That means a UAV quarantined during
+    # early, near-random policy exploration (before the reward signal has
+    # had time to differentiate contamination levels) accumulates a
+    # permanently higher q from what may have been a false positive - and
+    # since T_j^Q = e^(tau*q)/(1+rho) (Eq. 28) is exponential in q, that
+    # early flag means an exponentially longer quarantine on any FUTURE
+    # trigger, for the rest of the run, long after the false positive is
+    # forgotten. Enabling this wipes every UAV's q back to 0 exactly once,
+    # at the round the primer period ends, so early-exploration flags don't
+    # keep compounding through the rest of training.
+    reset_flags_after_primer: bool = True
+
+    # Fraction of total_rounds treated as the "primer" period for this
+    # reset. Deliberately a SEPARATE knob from exclude_warmup_fraction
+    # (even though both default to 0.10) rather than reusing it - you may
+    # want q to reset at a different point than when EXCLUDE unlocks, e.g.
+    # a longer/shorter primer for this specific mitigation.
+    flag_reset_fraction: float = 0.10
 
 
 # ---------------------------------------------------------------------------
@@ -349,7 +426,12 @@ class RoundSnapshot:
 class PPOAgent:
     """Proximal Policy Optimization for UAV state management."""
 
-    def __init__(self, rl_config: RLConfig, device: str = "cpu") -> None:
+    def __init__(
+        self,
+        rl_config: RLConfig,
+        device: str = "cpu",
+        total_rounds: Optional[int] = None,
+    ) -> None:
         self.config = rl_config
         self.device = device
         self.network = ActorCritic(hidden_dim=rl_config.hidden_dim).to(device)
@@ -357,13 +439,38 @@ class PPOAgent:
         self.buffer: List[Transition] = []
         # Training-stability guard (not part of the paper's formulation): the
         # policy network starts randomly initialized, so its action distribution
-        # is close to uniform until it has received at least one gradient step.
+        # is close to uniform until it has received several gradient steps.
         # Since Exclude is an absorbing action (excluded UAVs never rejoin),
-        # letting an untrained policy pick it risks permanently and arbitrarily
-        # removing benign UAVs before the reward signal has taught the policy
-        # anything. has_updated tracks whether update() has run at least once;
-        # callers can use it to mask Exclude out of the action space until then.
-        self.has_updated: bool = False
+        # letting an undertrained policy pick it risks permanently and
+        # arbitrarily removing benign UAVs before the reward signal has taught
+        # the policy anything. update_count tracks how many update() calls
+        # have completed; exclude_unlocked (below) gates Exclude out of the
+        # action space until enough of them have run, rather than unlocking
+        # it after a single update as before.
+        self.update_count: int = 0
+
+        # Resolve the warm-up as an absolute update count once, at
+        # construction time. When total_rounds is known (the normal case -
+        # HFLRLStation passes its HFLConfig.num_rounds), this is
+        # round(exclude_warmup_fraction * total_rounds), so the warm-up is a
+        # fixed *fraction* of the run regardless of --rounds. If total_rounds
+        # isn't available (e.g. PPOAgent constructed standalone), it falls
+        # back to the fixed rl_config.min_ppo_updates_before_exclude count.
+        if total_rounds is not None:
+            self._min_updates_before_exclude = max(
+                1, round(rl_config.exclude_warmup_fraction * total_rounds)
+            )
+        else:
+            self._min_updates_before_exclude = rl_config.min_ppo_updates_before_exclude
+
+    @property
+    def exclude_unlocked(self) -> bool:
+        """True once enough PPOAgent.update() calls have run to allow EXCLUDE.
+
+        Threshold is exclude_warmup_fraction * total_rounds (resolved at
+        construction time), or min_ppo_updates_before_exclude as a fallback.
+        """
+        return self.update_count >= self._min_updates_before_exclude
 
     def select_action(
         self, obs: torch.Tensor, allow_exclude: bool = True
@@ -445,7 +552,7 @@ class PPOAgent:
             }
 
         self.clear_buffer()
-        self.has_updated = True
+        self.update_count += 1
         return clip_stats
 
 
@@ -584,18 +691,27 @@ def compute_reward(
     """R_j^(t+1) = rho_j^(t) + Delta psi_j^(t) + Lambda(a)  (Eq. 26-27).
 
     Lambda(a) is piecewise in the action actually taken:
-      Allow      -> 0
-      Quarantine -> -T_j^Q(t)
+      Allow      -> -lambda_j^(t)
+      Quarantine -> -(1 - lambda_j^(t)) * T_j^Q(t)
       Exclude    -> -(1 - lambda_j^(t)) * rho_j^(t)
 
-    Unlike a flat penalty, this term must apply *only* when the UAV is
-    excluded, and must scale with (1 - lambda_j) and rho_j^(t), not
-    lambda_j, per Eq. 27.
+    Allow's penalty was changed from 0 (the paper's literal Eq. 27) to -lambda_j^(t):
+    directly punishing the policy for allowing a UAV in proportion to how contaminated
+    the detector currently believes it is, independent of Delta_psi's noisier signal.
+
+    Both governance actions are discounted by (1 - lambda_j) for internal
+    consistency: quarantining/excluding a UAV the detector is confident is
+    contaminated (lambda -> 1) should cost the policy little, while doing
+    so to a UAV with lambda -> 0 should cost the full penalty. Previously
+    only the Exclude branch carried this discount, so Quarantine gave the
+    policy zero contamination-linked signal and could not learn to treat a
+    lambda=0 UAV differently from a lambda=1 UAV when quarantining.
     """
     if action == UAVAction.ALLOW:
-        penalty = 0.0
+        penalty = -uav.contamination_score
     elif action == UAVAction.QUARANTINE:
-        penalty = -float(quarantine_duration)
+        lam = uav.contamination_score
+        penalty = -(1.0 - lam) * float(quarantine_duration)
     elif action == UAVAction.EXCLUDE:
         lam = uav.contamination_score
         rho = uav.reputation_at_t
@@ -629,10 +745,21 @@ class HFLRLStation(BaseStation):
         super().__init__(config)
         self.rl_config = rl_config or RLConfig()
         self.detector = contamination_detector or zero_contamination_detector
-        self.ppo = PPOAgent(self.rl_config, device=self.config.device)
+        self.ppo = PPOAgent(
+            self.rl_config, device=self.config.device, total_rounds=self.config.num_rounds
+        )
         self.validation_set: Optional[Dataset] = None
         self.round_actions: Dict[str, UAVAction] = {}
         self.round_history: List[RoundSnapshot] = []
+        # Resolved once here, same pattern as PPOAgent's exclude-unlock
+        # threshold: an absolute round number so the "primer" period scales
+        # with --rounds rather than being a fixed count that means something
+        # different at different horizon lengths. See RLConfig.
+        # flag_reset_fraction/reset_flags_after_primer for rationale.
+        self._flag_reset_round = max(
+            1, round(self.rl_config.flag_reset_fraction * self.config.num_rounds)
+        )
+        self._flags_reset_done = False
         # NOTE: checkpoint/rollback (Sec. 4.3, Algorithm 2) is intentionally NOT
         # implemented here. Per main.py's mode semantics, "rl" mode is PPO state
         # management only; checkpoint-based recovery is exclusive to "recovery"
@@ -708,7 +835,9 @@ class HFLRLStation(BaseStation):
         uav.residual_energy = compute_residual_energy(uav.num_samples, self.rl_config)
         uav.update_reputation(self.rl_config.reputation_lr, self.rl_config.penalty_tuning)
 
-    def _manage_states(self, round_idx: int) -> Dict[str, Dict[str, float]]:
+    def _manage_states(
+        self, round_idx: int, reference_weights: Dict[str, torch.Tensor]
+    ) -> Dict[str, Dict[str, float]]:
         """
         PPO state decision per coalition (Algorithm 1, lines 10-24).
         Returns per-UAV metadata needed for reward computation.
@@ -720,19 +849,49 @@ class HFLRLStation(BaseStation):
         UAVs are likewise skipped, but unlike EXCLUDED they are eligible to
         re-enter this loop once tick_quarantine() restores them to ACTIVE
         (Algorithm 1, line 29 / _process_quarantine_expiry).
+
+        Delta_psi_j (this round's accuracy attribution for UAV j) is computed
+        as a per-UAV counterfactual against a single fixed baseline, not the
+        previous sequential before/after-each-decision scheme:
+          - baseline_acc: accuracy of the coalition with every UAV that was
+            ACTIVE at the *start* of this round included (i.e. as if nobody's
+            action had been applied yet).
+          - For ALLOW: delta_psi = 0 by definition - the UAV's presence in
+            the aggregation is unchanged from baseline, so there is nothing
+            to attribute.
+          - For QUARANTINE/EXCLUDE: delta_psi = accuracy(baseline set minus
+            this UAV) - baseline_acc, i.e. "what if only this UAV's action
+            differed from ALLOW, holding every other UAV at ALLOW."
+        This removes the previous scheme's order-dependence (where UAV k's
+        delta_psi depended on whichever actions had already been applied to
+        UAVs processed earlier in the same round's loop) at the cost of not
+        capturing interaction effects between simultaneous decisions within
+        the same round - a deliberate reliability-over-speed tradeoff.
         """
         meta: Dict[str, Dict[str, float]] = {}
         transition_rows: List[Tuple[int, str, str, str, str, Optional[int], float]] = []
 
         for coalition in self.rl_coalitions:
-            acc_before = (
-                coalition.evaluate_accuracy(self.validation_set, self.config)
-                if self.validation_set is not None
+            # Fixed snapshot of who was active BEFORE any decision this round -
+            # both the baseline and every counterfactual are evaluated against
+            # this same set, never the live/mutating active_edge_uavs.
+            full_active = list(coalition.active_edge_uavs)
+
+            have_validation = self.validation_set is not None and len(full_active) > 0
+            probe = copy.deepcopy(full_active[0].model) if have_validation else None
+            baseline_acc = (
+                _evaluate_weights_accuracy(
+                    _aggregate_subset_weights(reference_weights, full_active),
+                    probe,
+                    self.validation_set,
+                    self.config,
+                )
+                if have_validation
                 else 0.0
             )
 
-            for uav in list(coalition.active_edge_uavs):
-                # Defensive guard: active_edge_uavs already filters to
+            for uav in full_active:
+                # Defensive guard: full_active already filters to
                 # ParticipationState.ACTIVE, but we assert it explicitly here
                 # so that EXCLUDED (terminal) and QUARANTINED (temporarily
                 # ineligible) UAVs can never be handed a PPO decision, even if
@@ -744,7 +903,7 @@ class HFLRLStation(BaseStation):
                 prev_participation = uav.participation
                 obs = uav.observation()
                 action, log_prob, value, probs = self.ppo.select_action(
-                    obs, allow_exclude=self.ppo.has_updated
+                    obs, allow_exclude=self.ppo.exclude_unlocked
                 )
                 quarantine_assigned = 0
 
@@ -763,13 +922,19 @@ class HFLRLStation(BaseStation):
 
                 self.round_actions[uav.uav_id] = action
 
-                acc_after = (
-                    coalition.evaluate_accuracy(self.validation_set, self.config)
-                    if self.validation_set is not None
-                    else 0.0
-                )
-                delta_psi = acc_after - acc_before
-                acc_before = acc_after
+                if action == UAVAction.ALLOW:
+                    delta_psi = 0.0
+                elif have_validation:
+                    counterfactual_subset = [u for u in full_active if u.uav_id != uav.uav_id]
+                    counterfactual_acc = _evaluate_weights_accuracy(
+                        _aggregate_subset_weights(reference_weights, counterfactual_subset),
+                        probe,
+                        self.validation_set,
+                        self.config,
+                    )
+                    delta_psi = counterfactual_acc - baseline_acc
+                else:
+                    delta_psi = 0.0
 
                 reward = compute_reward(uav, delta_psi, action, quarantine_assigned)
                 meta[uav.uav_id] = {
@@ -794,7 +959,23 @@ class HFLRLStation(BaseStation):
                     log_prob=log_prob,
                     value=value,
                     reward=reward,
-                    done=(action == UAVAction.EXCLUDE),
+                    # Every transition is its own complete episode: this buffer
+                    # holds one round's decisions across every active UAV in
+                    # every coalition, flattened into a single list and wiped
+                    # before next round - it is NOT one UAV's continuing
+                    # trajectory across time. Marking only EXCLUDE as done
+                    # (previous behavior) caused _compute_returns to chain
+                    # rewards backward across *adjacent but unrelated* UAVs'
+                    # transitions (e.g. UAV A's ALLOW return would include a
+                    # discounted share of UAV B's EXCLUDE penalty, purely
+                    # because B happened to be next in the list) - there is no
+                    # legitimate "next state" relationship between rows here
+                    # to bootstrap across. done=True makes every return equal
+                    # to its own reward, matching what this buffer actually
+                    # contains. A persistent per-UAV rollout buffer spanning
+                    # multiple rounds would be a prerequisite for done to mean
+                    # anything more than this.
+                    done=True,
                 ))
 
         if transition_rows:
@@ -802,8 +983,35 @@ class HFLRLStation(BaseStation):
 
         return meta
 
+    def _maybe_reset_flags(self, round_idx: int) -> bool:
+        """One-time q (flag_count) reset once the primer period ends.
+
+        See RLConfig.reset_flags_after_primer/flag_reset_fraction for the
+        rationale (mitigating early-exploration quarantine flags compounding
+        via Eq. 28's exponential T_j^Q for the rest of the run). Fires at
+        most once per run() call, at round self._flag_reset_round. Resets
+        every RLEdgeUAV's flag_count regardless of current participation
+        state (harmless no-op for EXCLUDED UAVs, since they never re-enter
+        the decision loop anyway; meaningful for ACTIVE and QUARANTINED
+        UAVs since a future quarantine's Eq. 28 duration will use the reset
+        q going forward).
+        """
+        if not self.rl_config.reset_flags_after_primer or self._flags_reset_done:
+            return False
+        if round_idx < self._flag_reset_round:
+            return False
+        for uav in self.rl_edge_uavs:
+            uav.flag_count = 0
+        self._flags_reset_done = True
+        print(
+            f"[Flag Reset] q reset to 0 for all {len(self.rl_edge_uavs)} UAVs "
+            f"at round {round_idx} (primer period ended)"
+        )
+        return True
+
     def train_round(self, round_idx: int) -> Dict[str, float]:
         """One HFL round with PPO state management (Algorithm 1)."""
+        self._maybe_reset_flags(round_idx)
         self._process_quarantine_expiry()
         self.distribute_global_model()
         reference_weights = copy.deepcopy(self.global_model.state_dict())
@@ -816,7 +1024,7 @@ class HFLRLStation(BaseStation):
         self._run_contamination_detection(reference_weights)
         self._update_reputations(reference_weights)
 
-        self._manage_states(round_idx)
+        self._manage_states(round_idx, reference_weights)
 
         coalition_weights: Dict[str, Dict[str, torch.Tensor]] = {}
         for coalition in self.rl_coalitions:
@@ -867,7 +1075,20 @@ class HFLRLStation(BaseStation):
     ) -> RoundSnapshot:
         snapshots: List[UAVRoundSnapshot] = []
         for uav in self.rl_edge_uavs:
-            action = self.round_actions.get(uav.uav_id, UAVAction.ALLOW)
+            # round_actions is cleared at the top of every round (run()) and
+            # only repopulated for UAVs actually processed by _manage_states
+            # that round (i.e. ParticipationState.ACTIVE at round start). A
+            # UAV still serving out an earlier quarantine sentence is skipped
+            # entirely this round - no fresh PPO decision was made for it.
+            # Previously this fell back to UAVAction.ALLOW, which mislabeled
+            # every such holdover as if the policy had freshly chosen Allow
+            # this round (readable in logs as e.g. "-> ALLOW (QUARANTINED)"),
+            # when no decision was made at all. "HOLD" makes that distinction
+            # explicit instead of silently reusing a real action's name.
+            if uav.uav_id in self.round_actions:
+                action_label = self.round_actions[uav.uav_id].name
+            else:
+                action_label = "HOLD"
             snapshots.append(
                 UAVRoundSnapshot(
                     uav_id=uav.uav_id,
@@ -875,7 +1096,7 @@ class HFLRLStation(BaseStation):
                     contamination_score=uav.contamination_score,
                     reputation=uav.reputation,
                     flag_count=uav.flag_count,
-                    action=action.name,
+                    action=action_label,
                     participation=uav.participation.name,
                     quarantine_remaining=uav.quarantine_rounds_remaining,
                     is_malicious=uav.is_malicious,
@@ -896,6 +1117,7 @@ class HFLRLStation(BaseStation):
         self.validation_set = validation_dataset or test_dataset
         self.round_history.clear()
         self.round_actions.clear()
+        self._flags_reset_done = False
 
         for uav in self.rl_edge_uavs:
             uav.reputation = self.rl_config.initial_reputation
