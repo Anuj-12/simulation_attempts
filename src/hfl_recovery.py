@@ -8,6 +8,31 @@ Implements Algorithm 2 (Checkpoint-Based Recovery and Model Reconstruction):
   - Global model reconstruction from rolled-back coalition weights
   - Quarantine expiry: rejoining UAVs receive the current global model
 
+NOTE - confirmed deviation from Algorithm 2 as literally written, default
+behavior (RecoveryConfig.checkpoint_after_rollback=True; see that field's
+docstring and HFLRecoveryStation.train_round for full detail):
+Algorithm 2 (ReCon.tex line 635-659, \\label{alg:checkpoint_recovery})
+checkpoints unconditionally FIRST every round, THEN checks for exclusion and
+rolls back - same iteration, in that literal order. That has a real design
+weakness the paper itself doesn't address: kappa (checkpoint urgency) is
+driven by accumulating contamination, so a checkpoint that fires is already
+reactive to damage that's been building; if an exclusion ALSO fires the
+same round, rolling back to a checkpoint saved moments earlier that same
+round barely helps, since it already reflects most of the same accumulated
+contamination. This module instead checkpoints AFTER any same-round
+rollback by default, so a fresh checkpoint (when warranted) captures the
+just-cleaned, post-rollback state. Set checkpoint_after_rollback=False to
+restore the paper's literal ordering exactly.
+
+Known remaining gap with the default (True) ordering, not yet addressed:
+during a stretch of several CONSECUTIVE rounds that each trigger a rollback
+(no "quiet" round in between), no new checkpoint is ever saved - the
+default ordering only checkpoints on rounds that did NOT just roll back, so
+t_c can stay anchored to an increasingly old round throughout a sustained
+attack, before any of THOSE rounds' governance actions get a chance to be
+captured as a new trusted baseline. Worth revisiting if sustained multi-
+round contamination streaks turn out to be common in practice.
+
 Dependency graph (acyclic):
   hfl_common  ->  hfl_base  ->  hfl_rl  ->  hfl_recovery
 
@@ -57,9 +82,27 @@ class RecoveryConfig:
         κ_th — urgency threshold above which a checkpoint is created.
         Lower values create more frequent checkpoints (tighter bound on
         contamination exposure per Theorem 2) at the cost of more storage.
+    checkpoint_after_rollback:
+        Confirmed deviation from Algorithm 2 (ReCon.tex line 635-659,
+        \\label{alg:checkpoint_recovery}) if True (the default). The paper's
+        literal pseudocode checkpoints FIRST every round (line 645-647,
+        unconditional on kappa), THEN checks for exclusion and rolls back
+        (line 649-652) - same iteration, checkpoint always precedes the
+        exclusion check. That ordering has a real weakness: kappa is driven
+        by accumulating contamination (Eq. checkpoint_urgency), so any
+        checkpoint that fires is, by construction, already reactive to
+        contamination that's been building - if an exclusion ALSO fires the
+        same round, rolling back to a checkpoint saved moments earlier in
+        that same round provides little protection, since that checkpoint
+        already reflects most of the same accumulated damage. True (default)
+        moves the checkpoint decision to the end of train_round, after any
+        same-round rollback, so a fresh checkpoint (when kappa still
+        warrants one) captures the just-cleaned, post-rollback state instead.
+        Set False to restore the paper's literal Algorithm 2 ordering exactly.
     """
 
     checkpoint_threshold: float = 5.0    # κ_th (design parameter)
+    checkpoint_after_rollback: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -143,12 +186,18 @@ class HFLRecoveryStation(HFLRLStation):
     Extends HFLRLStation (PPO state management) with the checkpoint-based
     recovery mechanism described in Sec. 4.3 / Algorithm 2.
 
-    New behaviour per round (inserted into train_round):
-      1. Compute κ; if κ ≥ κ_th → save coalition model checkpoint (t_c = t).
-      2. After PPO state decisions, if any UAV was EXCLUDED → rollback all
-         coalition models to the last checkpoint, reconstruct and broadcast
-         the global model from rolled-back weights.
-      3. Quarantine expiry is handled identically to HFLRLStation but the
+    New behaviour per round (inserted into train_round). Ordering is
+    controlled by RecoveryConfig.checkpoint_after_rollback (default True);
+    see that field's docstring and train_round's own docstring for the full
+    rationale and the confirmed deviation from Algorithm 2 as literally
+    written (ReCon.tex line 635-659) when the default is used:
+      1. Run this round's PPO state decisions and aggregation first.
+      2. If any UAV was newly EXCLUDED this round -> roll back all
+         coalition models to the last checkpoint (from a prior round),
+         reconstruct and broadcast the global model from rolled-back weights.
+      3. Otherwise, compute κ; if κ ≥ κ_th -> save a fresh coalition model
+         checkpoint (t_c = t) reflecting this round's already-validated state.
+      4. Quarantine expiry is handled identically to HFLRLStation but the
          rejoining UAV also receives the (possibly rolled-back) global model.
     """
 
@@ -300,21 +349,54 @@ class HFLRecoveryStation(HFLRLStation):
         """
         One HFL round with PPO + checkpoint-based recovery.
 
-        Extended flow vs. HFLRLStation.train_round:
-          (a) Before local training: evaluate κ and checkpoint if needed.
-          (b) After PPO state decisions: if any EXCLUDE action occurred,
-              trigger rollback + global reconstruction.
-          (c) Quarantine expiry (unchanged, now with logging).
-        """
-        # (a) Checkpoint decision BEFORE this round's aggregation so the
-        #     checkpoint reflects the model state after the PREVIOUS clean round.
-        self._maybe_checkpoint(round_idx)
+        Two orderings, controlled by RecoveryConfig.checkpoint_after_rollback:
 
-        # Snapshot which UAVs were active before PPO decisions so we can
-        # detect new exclusions after the round completes.
+        checkpoint_after_rollback=False (paper-literal, Algorithm 2 line
+        635-659 exactly):
+          (a) Compute kappa; if kappa >= kappa_th, checkpoint (t_c = t) -
+              unconditionally, every round, BEFORE this round's decisions.
+          (b) Run this round's decisions (local training, state management,
+              aggregation).
+          (c) If any EXCLUDE action occurred, roll back to the last
+              checkpoint (t_c) and reconstruct - which, if (a) just fired
+              this same round, is the checkpoint saved moments earlier in
+              step (a) of THIS round.
+
+        checkpoint_after_rollback=True (default; confirmed deviation from
+        Algorithm 2 - see RecoveryConfig docstring for the full rationale):
+          (a) Run this round's decisions first.
+          (b) If any EXCLUDE action occurred, roll back to the last
+              checkpoint (from a PRIOR round, never one just saved this
+              same round under this ordering) and reconstruct.
+          (c) Otherwise (a "quiet" round), evaluate kappa and checkpoint if
+              warranted, using this round's freshly-computed active UAVs
+              and lambda/q values (a side effect of running (a) first:
+              _run_contamination_detection has already updated every active
+              UAV's contamination_score by the time this checkpoint decision
+              runs, whereas under the paper-literal ordering it uses
+              whatever contamination_score values were left over from the
+              PREVIOUS round's detection pass).
+        """
+        if not self.recovery_config.checkpoint_after_rollback:
+            # Paper-literal Algorithm 2 ordering: checkpoint unconditionally
+            # first, every round, before this round's decisions even run.
+            self._maybe_checkpoint(round_idx)
+            previously_excluded = {u.uav_id for u in self.excluded_uavs}
+            losses = super().train_round(round_idx)
+            newly_excluded = {u.uav_id for u in self.excluded_uavs} - previously_excluded
+            if newly_excluded:
+                print(
+                    f"  [Recovery] UAV(s) {newly_excluded} permanently excluded. "
+                    "Initiating checkpoint rollback."
+                )
+                self._rollback_and_reconstruct(round_idx)
+            return losses
+
+        # Snapshot which UAVs were excluded before this round's decisions so
+        # we can detect new exclusions after the round completes.
         previously_excluded = {u.uav_id for u in self.excluded_uavs}
 
-        # Run the standard RL training round (local train → state mgmt → aggregate → PPO update).
+        # (a) Run the standard RL training round (local train -> state mgmt -> aggregate -> PPO update).
         losses = super().train_round(round_idx)
 
         # (b) Check for new exclusions and trigger rollback if any occurred.
@@ -325,6 +407,14 @@ class HFLRecoveryStation(HFLRLStation):
                 "Initiating checkpoint rollback."
             )
             self._rollback_and_reconstruct(round_idx)
+        else:
+            # (c) Only checkpoint on rounds that didn't just roll back - a
+            # round immediately following (or containing) a rollback
+            # reverted to an already-checkpointed state, so re-checkpointing
+            # it here would just re-save something we already have, and
+            # kappa's inputs (lambda/q of whoever triggered the exclusion)
+            # would likely still read as elevated immediately afterward.
+            self._maybe_checkpoint(round_idx)
 
         return losses
 

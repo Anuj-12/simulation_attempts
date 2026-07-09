@@ -198,6 +198,25 @@ class RLConfig:
     # EXCLUDED UAVs - exclude remains a terminal state, per Algorithm 1.
     release_quarantine_after_primer: bool = True
 
+    # Shadow-exclude during the primer period (also NOT in the paper).
+    # When exclude_unlocked is False, EXCLUDE was previously masked out of
+    # the action space entirely (see ActorCritic.act's action_mask), so the
+    # policy could never sample it and could only ever receive negative
+    # reinforcement on its logit (softmax gradients touch every output, and
+    # a never-chosen action can only ever be pushed down, never up) - by the
+    # time EXCLUDE unlocked, its head had been passively suppressed for the
+    # whole primer period with zero chance to learn when excluding would
+    # actually have paid off. When this is True, EXCLUDE can be sampled
+    # during the primer period like any other action, and its reward is
+    # computed exactly as if it had been applied (delta_psi's counterfactual
+    # already works this way regardless of whether the removal is real) -
+    # but the UAV's real participation state is NOT changed; it stays
+    # ACTIVE. Only once exclude_unlocked is True does a sampled EXCLUDE
+    # become a real, applied exclusion. Set False to fall back to the old
+    # masking behavior (EXCLUDE unsampleable, no shadow reward, during the
+    # primer period).
+    shadow_exclude_during_primer: bool = True
+
 
 # ---------------------------------------------------------------------------
 # RL-enriched edge UAV
@@ -648,7 +667,7 @@ def _print_state_transitions(
         extra = f" T_Q={quarantine_duration}" if quarantine_duration else ""
         print(
             f"Round {round_idx:>3} | {uav_id:<8} | {transition:<28} | "
-            f"action={action_name:<10}{extra} | reward={reward:8.3f}"
+            f"action={action_name:<18}{extra} | reward={reward:8.3f}"
         )
 
 
@@ -826,6 +845,7 @@ class HFLRLStation(BaseStation):
         )
         self.validation_set: Optional[Dataset] = None
         self.round_actions: Dict[str, UAVAction] = {}
+        self.shadow_excluded_this_round: set = set()
         self.round_history: List[RoundSnapshot] = []
         # Resolved once here, same pattern as PPOAgent's exclude-unlock
         # threshold: an absolute round number so the "primer" period scales
@@ -978,10 +998,19 @@ class HFLRLStation(BaseStation):
 
                 prev_participation = uav.participation
                 obs = uav.observation()
-                action, log_prob, value, probs = self.ppo.select_action(
-                    obs, allow_exclude=self.ppo.exclude_unlocked
-                )
+                if self.rl_config.shadow_exclude_during_primer:
+                    # EXCLUDE is always sampleable; whether it's REALLY
+                    # applied is decided below by exclude_unlocked. See
+                    # RLConfig.shadow_exclude_during_primer for rationale.
+                    action, log_prob, value, probs = self.ppo.select_action(obs)
+                else:
+                    # Old behavior: EXCLUDE is masked out of the action
+                    # space entirely until exclude_unlocked.
+                    action, log_prob, value, probs = self.ppo.select_action(
+                        obs, allow_exclude=self.ppo.exclude_unlocked
+                    )
                 quarantine_assigned = 0
+                shadow_excluded = False
 
                 # The action PPO selects must always be the action that is
                 # implemented on the UAV's participation state - previously
@@ -991,10 +1020,25 @@ class HFLRLStation(BaseStation):
                 # never actually changing uav.participation. Applying the
                 # action directly to the UAV removes that dependency on the
                 # fog's type and guarantees decision == effect.
+                # EXCEPTION: a sampled EXCLUDE while exclude_unlocked is
+                # still False and shadow_exclude_during_primer is True is a
+                # deliberate exception to "decision == effect" - the reward
+                # is computed as if it happened (see compute_reward/delta_psi
+                # below, both already action-based rather than state-based),
+                # but uav.participation is intentionally left unchanged so
+                # the primer period carries zero real exclusion risk.
                 if action == UAVAction.QUARANTINE:
                     quarantine_assigned = uav.assign_quarantine(self.rl_config.penalty_tuning)
                 elif action == UAVAction.EXCLUDE:
-                    uav.exclude()
+                    if self.ppo.exclude_unlocked:
+                        uav.exclude()
+                    elif self.rl_config.shadow_exclude_during_primer:
+                        shadow_excluded = True
+                        self.shadow_excluded_this_round.add(uav.uav_id)
+                    # else: unreachable when shadow_exclude_during_primer is
+                    # False, since select_action was called with
+                    # allow_exclude=False in that branch above, masking
+                    # EXCLUDE out of the sampled distribution entirely.
 
                 self.round_actions[uav.uav_id] = action
 
@@ -1024,7 +1068,7 @@ class HFLRLStation(BaseStation):
                     uav.uav_id,
                     prev_participation.name,
                     uav.participation.name,
-                    action.name,
+                    action.name + (" (SHADOW)" if shadow_excluded else ""),
                     quarantine_assigned or None,
                     reward,
                 ))
@@ -1176,6 +1220,13 @@ class HFLRLStation(BaseStation):
             # explicit instead of silently reusing a real action's name.
             if uav.uav_id in self.round_actions:
                 action_label = self.round_actions[uav.uav_id].name
+                if uav.uav_id in self.shadow_excluded_this_round:
+                    # Sampled EXCLUDE during the primer period, rewarded as
+                    # if applied, but participation deliberately left
+                    # unchanged - see RLConfig.shadow_exclude_during_primer.
+                    # Marked explicitly so this isn't confused with a real
+                    # exclude when read alongside participation=ACTIVE.
+                    action_label += " (SHADOW)"
             else:
                 action_label = "HOLD"
             snapshots.append(
@@ -1206,6 +1257,7 @@ class HFLRLStation(BaseStation):
         self.validation_set = validation_dataset or test_dataset
         self.round_history.clear()
         self.round_actions.clear()
+        self.shadow_excluded_this_round.clear()
         self._flags_reset_done = False
 
         for uav in self.rl_edge_uavs:
@@ -1219,6 +1271,7 @@ class HFLRLStation(BaseStation):
         history: List[Dict[str, float]] = []
         for round_idx in range(1, self.config.num_rounds + 1):
             self.round_actions.clear()
+            self.shadow_excluded_this_round.clear()
             losses = self.train_round(round_idx)
             loss, acc = self._evaluate_global(test_dataset)
             ppo_loss = losses.get("__ppo_policy_loss__", 0.0)
