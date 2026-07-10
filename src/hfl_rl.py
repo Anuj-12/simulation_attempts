@@ -782,13 +782,14 @@ def compute_reward(
     delta_psi: float,
     action: UAVAction,
     quarantine_duration: int,
+    tau: float,
 ) -> float:
     """R_j^(t+1) = rho_j^(t) + Delta psi_j^(t) + Lambda(a)  (Eq. 26-27).
 
     Lambda(a) is piecewise in the action actually taken:
       Allow      -> -lambda_j^(t)
       Quarantine -> -(1 - lambda_j^(t)) * T_j^Q(t)
-      Exclude    -> -(1 - lambda_j^(t)) * rho_j^(t)
+      Exclude    -> -(1 - lambda_j^(t)) * rho_j^(t) * e^(tau * q_j^(t))
 
     Allow's penalty was changed from 0 (the paper's literal Eq. 27) to -lambda_j^(t):
     directly punishing the policy for allowing a UAV in proportion to how contaminated
@@ -801,6 +802,23 @@ def compute_reward(
     only the Exclude branch carried this discount, so Quarantine gave the
     policy zero contamination-linked signal and could not learn to treat a
     lambda=0 UAV differently from a lambda=1 UAV when quarantining.
+
+    The e^(tau*q) factor on Exclude's penalty (added after observing
+    persistent over-exclusion in practice) is NOT a new tuned constant -
+    it reuses the exact same exponential term already present in Eq. 28
+    (T_j^Q = e^(tau*q)/(1+rho)) and in Eq. 7's penalty term
+    (lambda*E_ret*e^(tau*q)/phi), using the same tau (RLConfig.penalty_tuning)
+    Quarantine's own formula uses. Without it, rho (typically ~0.4-1.0 in
+    practice) stays roughly flat while T_j^Q grows exponentially with q
+    (e.g. ~1 at q=1 vs ~13 at q=3), making Exclude systematically ~10-25x
+    cheaper than Quarantine for the same UAV once q accumulates even a
+    little - a scale mismatch baked into the reward function itself, not
+    a training or exploration problem, that would bias the policy toward
+    Exclude regardless of how well-trained it is. Scaling by the same
+    e^(tau*q) term Quarantine already uses closes most of that gap while
+    keeping Exclude somewhat cheaper than Quarantine at very high q, which
+    is arguably the right shape given Exclude is meant to be the higher-
+    confidence, more severe, last-resort action.
     """
     if action == UAVAction.ALLOW:
         penalty = -uav.contamination_score
@@ -810,7 +828,7 @@ def compute_reward(
     elif action == UAVAction.EXCLUDE:
         lam = uav.contamination_score
         rho = uav.reputation_at_t
-        penalty = -(1.0 - lam) * rho
+        penalty = -(1.0 - lam) * rho * math.exp(tau * uav.flag_count)
     else:
         raise ValueError(f"Unrecognized action {action!r}")
 
@@ -1056,7 +1074,9 @@ class HFLRLStation(BaseStation):
                 else:
                     delta_psi = 0.0
 
-                reward = compute_reward(uav, delta_psi, action, quarantine_assigned)
+                reward = compute_reward(
+                    uav, delta_psi, action, quarantine_assigned, self.rl_config.penalty_tuning
+                )
                 meta[uav.uav_id] = {
                     "reward": reward,
                     "delta_psi": delta_psi,
