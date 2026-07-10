@@ -450,6 +450,21 @@ class Transition:
 
 
 @dataclass
+class RewardBreakdown:
+    """Diagnostic decomposition of compute_reward's output, so a decision's
+    reward can be inspected term-by-term (rho_j^(t), Delta_psi, Lambda(a))
+    instead of only the summed total - added after two rounds of guessing
+    which term was driving over-exclusion turned out to need actual
+    component-level numbers rather than another blind reward-formula patch.
+    """
+
+    total: float
+    rho_t: float
+    delta_psi: float
+    penalty: float  # Lambda(a)
+
+
+@dataclass
 class UAVRoundSnapshot:
     """Per-UAV metrics captured each FL round for readiness reporting."""
 
@@ -657,17 +672,24 @@ class PPOAgent:
 
 
 def _print_state_transitions(
-    rows: List[Tuple[int, str, str, str, str, Optional[int], float]]
+    rows: List[Tuple[int, str, str, str, str, Optional[int], "RewardBreakdown"]]
 ) -> None:
     """Print one line per UAV decision this round, showing the participation
     state transition actually caused by the PPO action (not just the raw
-    action/observation metrics)."""
+    action/observation metrics), plus the reward broken into its rho_t /
+    Delta_psi / Lambda(a) components rather than only the summed total -
+    added so a given decision's reward can be diagnosed term-by-term
+    directly from the logs, instead of having to guess which term is
+    driving it from the total alone."""
     for round_idx, uav_id, prev_state, new_state, action_name, quarantine_duration, reward in rows:
         transition = f"{prev_state} -> {new_state}" if prev_state != new_state else f"{prev_state} (unchanged)"
         extra = f" T_Q={quarantine_duration}" if quarantine_duration else ""
         print(
             f"Round {round_idx:>3} | {uav_id:<8} | {transition:<28} | "
-            f"action={action_name:<18}{extra} | reward={reward:8.3f}"
+            f"action={action_name:<18}{extra} | "
+            f"reward={reward.total:8.3f} "
+            f"(rho_t={reward.rho_t:6.3f} + d_psi={reward.delta_psi:7.3f} + "
+            f"penalty={reward.penalty:8.3f})"
         )
 
 
@@ -783,7 +805,7 @@ def compute_reward(
     action: UAVAction,
     quarantine_duration: int,
     tau: float,
-) -> float:
+) -> RewardBreakdown:
     """R_j^(t+1) = rho_j^(t) + Delta psi_j^(t) + Lambda(a)  (Eq. 26-27).
 
     Lambda(a) is piecewise in the action actually taken:
@@ -819,6 +841,22 @@ def compute_reward(
     keeping Exclude somewhat cheaper than Quarantine at very high q, which
     is arguably the right shape given Exclude is meant to be the higher-
     confidence, more severe, last-resort action.
+
+    IMPORTANT: uses (flag_count + 1), not the raw flag_count. assign_quarantine
+    increments flag_count BEFORE computing T_j^Q (Eq. 28), so Quarantine's own
+    cost is always computed from the POST-increment q - comparing that against
+    Exclude's PRE-increment q was an apples-to-oranges mismatch that left this
+    e^(tau*q) fix completely inert for any UAV that had never been quarantined
+    before (q=0 -> e^0=1 -> collapses back to the original flat, too-cheap
+    -(1-lambda)*rho with no scaling at all). This matters most exactly at the
+    moment EXCLUDE first unlocks: reset_flags_after_primer and
+    release_quarantine_after_primer both fire at the same round
+    exclude_unlocked does by default, meaning every UAV has q=0 right when
+    Exclude becomes real for the first time - precisely where the unfixed
+    version provided zero protection. Using q+1 consistently also gives this
+    a sensible "escalation" property: a first-time flag (q=0->1) now costs
+    MORE to Exclude than to Quarantine, i.e. try the reversible action before
+    the irreversible one, rather than either being systematically favored.
     """
     if action == UAVAction.ALLOW:
         penalty = -uav.contamination_score
@@ -828,14 +866,17 @@ def compute_reward(
     elif action == UAVAction.EXCLUDE:
         lam = uav.contamination_score
         rho = uav.reputation_at_t
-        penalty = -(1.0 - lam) * rho * math.exp(tau * uav.flag_count)
+        penalty = -(1.0 - lam) * rho * math.exp(tau * (uav.flag_count + 1))
     else:
         raise ValueError(f"Unrecognized action {action!r}")
 
     # Eq. 26 uses rho_j^(t) explicitly (not the rho_j^(t+1) already computed
     # this round by _update_reputations via Eq. 7), so the pre-update value
     # cached in reputation_at_t must be used here rather than uav.reputation.
-    return uav.reputation_at_t + delta_psi + penalty
+    total = uav.reputation_at_t + delta_psi + penalty
+    return RewardBreakdown(
+        total=total, rho_t=uav.reputation_at_t, delta_psi=delta_psi, penalty=penalty
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -983,7 +1024,7 @@ class HFLRLStation(BaseStation):
         the same round - a deliberate reliability-over-speed tradeoff.
         """
         meta: Dict[str, Dict[str, float]] = {}
-        transition_rows: List[Tuple[int, str, str, str, str, Optional[int], float]] = []
+        transition_rows: List[Tuple[int, str, str, str, str, Optional[int], RewardBreakdown]] = []
 
         for coalition in self.rl_coalitions:
             # Fixed snapshot of who was active BEFORE any decision this round -
@@ -1078,7 +1119,7 @@ class HFLRLStation(BaseStation):
                     uav, delta_psi, action, quarantine_assigned, self.rl_config.penalty_tuning
                 )
                 meta[uav.uav_id] = {
-                    "reward": reward,
+                    "reward": reward.total,
                     "delta_psi": delta_psi,
                     "quarantine_assigned": float(quarantine_assigned),
                 }
@@ -1098,7 +1139,7 @@ class HFLRLStation(BaseStation):
                     action=action.value,
                     log_prob=log_prob,
                     value=value,
-                    reward=reward,
+                    reward=reward.total,
                     # Every transition is its own complete episode: this buffer
                     # holds one round's decisions across every active UAV in
                     # every coalition, flattened into a single list and wiped
