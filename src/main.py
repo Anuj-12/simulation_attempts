@@ -125,6 +125,15 @@ def parse_args() -> argparse.Namespace:
         help="κ_th: urgency score for checkpoint creation (default: 2.0)",
     )
     parser.add_argument(
+        "--paper-literal-checkpoint-order",
+        action="store_true",
+        help="Use Algorithm 2's literal ordering (checkpoint unconditionally every "
+        "round, before checking for exclusion/rollback), instead of the default "
+        "improved ordering (checkpoint after any same-round rollback). Only "
+        "affects --mode recovery. See hfl_recovery.py's module docstring for why "
+        "the default deviates from Algorithm 2 as written.",
+    )
+    parser.add_argument(
         "--no-flag-reset",
         action="store_true",
         help="Disable the one-time q (flag_count) reset that otherwise fires once, "
@@ -133,13 +142,37 @@ def parse_args() -> argparse.Namespace:
         "q_j (Eq. 7/28 have no reset term).",
     )
     parser.add_argument(
+        "--primer-fraction",
+        type=float,
+        default=None,
+        help="Convenience flag: sets BOTH --exclude-warmup-fraction and "
+        "--flag-reset-fraction to this value at once. These are independent "
+        "RLConfig fields for a reason (you may want EXCLUDE to unlock at a "
+        "different point than when q resets) - passing either flag individually "
+        "overrides this for that specific field. Without this or the individual "
+        "flags, each defaults to 0.10 independently.",
+    )
+    parser.add_argument(
+        "--exclude-warmup-fraction",
+        type=float,
+        default=None,
+        help="Fraction of --rounds during which EXCLUDE stays shadow-only (or fully "
+        "masked out if --no-shadow-exclude) rather than being really applied "
+        "(default: 0.10, i.e. 10%% of the run, unless --primer-fraction is set). "
+        "THIS is the flag that actually controls when EXCLUDE goes live for real - "
+        "--flag-reset-fraction only controls the separate q-reset/quarantine-release "
+        "event and does NOT extend real-exclusion protection on its own.",
+    )
+    parser.add_argument(
         "--flag-reset-fraction",
         type=float,
-        default=0.10,
+        default=None,
         help="Fraction of --rounds treated as the primer period before the one-time "
-        "q reset fires (default: 0.10, i.e. 10%% of the run). Independent of "
-        "--rounds itself - e.g. 0.10 means round 10 on a 100-round run but round 100 "
-        "on a 1000-round run. Ignored if --no-flag-reset is set.",
+        "q reset fires (default: 0.10, i.e. 10%% of the run, unless --primer-fraction "
+        "is set). Independent of --rounds itself - e.g. 0.10 means round 10 on a "
+        "100-round run but round 100 on a 1000-round run. Ignored if --no-flag-reset "
+        "is set. NOTE: does not affect when EXCLUDE goes live for real - see "
+        "--exclude-warmup-fraction for that.",
     )
     parser.add_argument(
         "--no-quarantine-release",
@@ -148,6 +181,19 @@ def parse_args() -> argparse.Namespace:
         "the same primer-end event as the q reset (default: released). Does not "
         "affect EXCLUDED UAVs, which remain terminal. Ignored if --no-flag-reset "
         "is set, since this fires at the same event.",
+    )
+    parser.add_argument(
+        "--no-shadow-exclude",
+        action="store_true",
+        help="Disable shadow-exclude during the primer period (default: enabled). "
+        "By default, EXCLUDE can be sampled and rewarded during the primer period "
+        "like any other action, but is not actually applied to the UAV's "
+        "participation state until exclude_unlocked - this lets the policy learn "
+        "when excluding would pay off without any real exclusion risk while it's "
+        "still undertrained. Disabling falls back to masking EXCLUDE out of the "
+        "action space entirely during the primer period (the old behavior), which "
+        "gives EXCLUDE's logit no chance at positive reinforcement before it "
+        "unlocks.",
     )
     parser.add_argument("--rounds", type=int, default=100, help="Number of FL rounds")
     parser.add_argument("--local-epochs", type=int, default=1, help="Local epochs per round")
@@ -181,14 +227,35 @@ def make_hfl_config(args: argparse.Namespace) -> HFLConfig:
 
 
 def make_rl_config(args: argparse.Namespace) -> RLConfig:
-    """Only overrides the flag-reset/quarantine-release fields from CLI args;
-    everything else (reputation_lr, entropy_coef, exclude_warmup_fraction,
-    etc.) still uses RLConfig's dataclass defaults, unchanged by this
-    function."""
+    """Overrides the flag-reset/quarantine-release/shadow-exclude/exclude-warmup
+    fields from CLI args; everything else (reputation_lr, entropy_coef, etc.)
+    still uses RLConfig's dataclass defaults, unchanged by this function.
+
+    Precedence for the two primer-length fields: an explicitly-set individual
+    flag (--exclude-warmup-fraction / --flag-reset-fraction) always wins;
+    otherwise --primer-fraction sets both; otherwise each falls back to
+    RLConfig's own default (0.10) independently. These two fields are
+    deliberately independent - --primer-fraction is a convenience for the
+    common case of wanting them equal, not a merge of the fields themselves.
+    """
+    default_kwargs = {}
+    exclude_warmup = (
+        args.exclude_warmup_fraction
+        if args.exclude_warmup_fraction is not None
+        else args.primer_fraction
+    )
+    if exclude_warmup is not None:
+        default_kwargs["exclude_warmup_fraction"] = exclude_warmup
+
+    flag_reset = args.flag_reset_fraction if args.flag_reset_fraction is not None else args.primer_fraction
+    if flag_reset is not None:
+        default_kwargs["flag_reset_fraction"] = flag_reset
+
     return RLConfig(
         reset_flags_after_primer=not args.no_flag_reset,
-        flag_reset_fraction=args.flag_reset_fraction,
         release_quarantine_after_primer=not args.no_quarantine_release,
+        shadow_exclude_during_primer=not args.no_shadow_exclude,
+        **default_kwargs,
     )
 
 
@@ -414,7 +481,10 @@ def main() -> None:
             rl_config=rl_config,
         )
     else:
-        recovery_config = RecoveryConfig(checkpoint_threshold=args.checkpoint_threshold)
+        recovery_config = RecoveryConfig(
+            checkpoint_threshold=args.checkpoint_threshold,
+            checkpoint_after_rollback=not args.paper_literal_checkpoint_order,
+        )
         station = run_recovery_mode(
             config,
             DEFAULT_COALITIONS,
@@ -436,4 +506,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()  
+    main()
