@@ -24,14 +24,23 @@ rollback by default, so a fresh checkpoint (when warranted) captures the
 just-cleaned, post-rollback state. Set checkpoint_after_rollback=False to
 restore the paper's literal ordering exactly.
 
-Known remaining gap with the default (True) ordering, not yet addressed:
-during a stretch of several CONSECUTIVE rounds that each trigger a rollback
-(no "quiet" round in between), no new checkpoint is ever saved - the
-default ordering only checkpoints on rounds that did NOT just roll back, so
-t_c can stay anchored to an increasingly old round throughout a sustained
-attack, before any of THOSE rounds' governance actions get a chance to be
-captured as a new trusted baseline. Worth revisiting if sustained multi-
-round contamination streaks turn out to be common in practice.
+FIXED (previously documented here as "known, not yet addressed" - confirmed as
+a real, active bug via an actual run's logs, not just a theoretical edge
+case): under the default (True) ordering, checkpointing used to be skipped
+entirely on any round that also triggered a rollback, on the assumption
+that a round following a rollback has "nothing new to save." During a
+sustained streak of consecutive rollback-triggering rounds (which
+mass-exclusion produces easily), that meant no new checkpoint was EVER
+saved - one run's logs showed t_c frozen at round 27 all the way through
+round 100, 73 rounds without a single new checkpoint. This froze the global
+model itself (every round reconstructed back to the same stale snapshot),
+which in turn explains Delta_psi reading permanently ~0 (a frozen model's
+accuracy can't move regardless of which UAV is hypothetically removed) and
+contamination scores drifting unreliable (fresh per-round local training
+compared against an increasingly stale reference). The checkpoint decision
+is now evaluated every round unconditionally, using the post-rollback,
+post-reconstruction weights on rounds where a rollback also fired - see
+HFLRecoveryStation.train_round's docstring and inline comments for detail.
 
 Dependency graph (acyclic):
   hfl_common  ->  hfl_base  ->  hfl_rl  ->  hfl_recovery
@@ -98,6 +107,10 @@ class RecoveryConfig:
         moves the checkpoint decision to the end of train_round, after any
         same-round rollback, so a fresh checkpoint (when kappa still
         warrants one) captures the just-cleaned, post-rollback state instead.
+        This checkpoint decision runs every round unconditionally (fixed -
+        an earlier version skipped it on any round that also rolled back,
+        which starved checkpointing entirely during a sustained rollback
+        streak; see train_round's docstring).
         Set False to restore the paper's literal Algorithm 2 ordering exactly.
     """
 
@@ -195,8 +208,10 @@ class HFLRecoveryStation(HFLRLStation):
       2. If any UAV was newly EXCLUDED this round -> roll back all
          coalition models to the last checkpoint (from a prior round),
          reconstruct and broadcast the global model from rolled-back weights.
-      3. Otherwise, compute κ; if κ ≥ κ_th -> save a fresh coalition model
-         checkpoint (t_c = t) reflecting this round's already-validated state.
+      3. Every round, regardless of whether step 2 also fired: compute κ;
+         if κ ≥ κ_th -> save a fresh coalition model checkpoint (t_c = t)
+         reflecting this round's already-validated (and, if step 2 fired,
+         post-rollback-reconstructed) state.
       4. Quarantine expiry is handled identically to HFLRLStation but the
          rejoining UAV also receives the (possibly rolled-back) global model.
     """
@@ -368,14 +383,19 @@ class HFLRecoveryStation(HFLRLStation):
           (b) If any EXCLUDE action occurred, roll back to the last
               checkpoint (from a PRIOR round, never one just saved this
               same round under this ordering) and reconstruct.
-          (c) Otherwise (a "quiet" round), evaluate kappa and checkpoint if
-              warranted, using this round's freshly-computed active UAVs
-              and lambda/q values (a side effect of running (a) first:
-              _run_contamination_detection has already updated every active
-              UAV's contamination_score by the time this checkpoint decision
-              runs, whereas under the paper-literal ordering it uses
-              whatever contamination_score values were left over from the
-              PREVIOUS round's detection pass).
+          (c) Evaluate kappa and checkpoint if warranted - EVERY round,
+              regardless of whether (b) also just fired this round (fixed;
+              previously gated to "quiet" rounds only, which starved
+              checkpointing during any sustained rollback streak - see the
+              inline comment at this step for the full story). Uses this
+              round's freshly-computed active UAVs and lambda/q values (a
+              side effect of running (a) first: _run_contamination_detection
+              has already updated every active UAV's contamination_score by
+              the time this checkpoint decision runs, whereas under the
+              paper-literal ordering it uses whatever contamination_score
+              values were left over from the PREVIOUS round's detection
+              pass), and the post-rollback, post-reconstruction weights if
+              (b) fired this round.
         """
         if not self.recovery_config.checkpoint_after_rollback:
             # Paper-literal Algorithm 2 ordering: checkpoint unconditionally
@@ -407,14 +427,31 @@ class HFLRecoveryStation(HFLRLStation):
                 "Initiating checkpoint rollback."
             )
             self._rollback_and_reconstruct(round_idx)
-        else:
-            # (c) Only checkpoint on rounds that didn't just roll back - a
-            # round immediately following (or containing) a rollback
-            # reverted to an already-checkpointed state, so re-checkpointing
-            # it here would just re-save something we already have, and
-            # kappa's inputs (lambda/q of whoever triggered the exclusion)
-            # would likely still read as elevated immediately afterward.
-            self._maybe_checkpoint(round_idx)
+
+        # (c) FIX (confirmed via an actual run's logs: t_c stayed frozen at
+        # round 27 all the way through round 100 - checkpoint starvation
+        # during a sustained rollback streak, previously flagged in this
+        # class's docstring as a known-but-unaddressed gap). The checkpoint
+        # decision used to be skipped entirely on any round that also
+        # rolled back, on the assumption that a rollback "reverts to an
+        # already-checkpointed state, nothing new to save." That assumption
+        # was wrong: _rollback_and_reconstruct doesn't just revert, it
+        # RECONSTRUCTS the global model from the CURRENTLY active coalition
+        # membership, which is a genuinely different (and more current)
+        # state than the raw prior checkpoint whenever membership has
+        # changed since t_c. If mass-exclusion causes nearly every round to
+        # trigger a rollback, the old "only on quiet rounds" gate meant
+        # kappa essentially never got a chance to fire again, freezing t_c
+        # indefinitely and, with it, the global model itself - which also
+        # explains Delta_psi reading permanently ~0 (a frozen model's
+        # accuracy can't change no matter which UAV is hypothetically
+        # removed) and contamination scores drifting unreliable (every
+        # active UAV's fresh training gets compared against an increasingly
+        # stale reference). Now unconditional: kappa is evaluated, and a
+        # fresh checkpoint saved if warranted, every round regardless of
+        # whether a rollback also just happened - using the post-rollback,
+        # post-reconstruction weights when one did.
+        self._maybe_checkpoint(round_idx)
 
         return losses
 
