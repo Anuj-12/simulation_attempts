@@ -688,7 +688,7 @@ def _print_state_transitions(
             f"Round {round_idx:>3} | {uav_id:<8} | {transition:<28} | "
             f"action={action_name:<18}{extra} | "
             f"reward={reward.total:8.3f} "
-            f"(rho_t={reward.rho_t:6.3f} + d_psi={reward.delta_psi:7.3f} + "
+            f"(rho_t={reward.rho_t:6.3f} + d_psi={reward.delta_psi:10.6f} + "
             f"penalty={reward.penalty:8.3f})"
         )
 
@@ -1112,6 +1112,19 @@ class HFLRLStation(BaseStation):
                         self.config,
                     )
                     delta_psi = counterfactual_acc - baseline_acc
+                    # Temporary diagnostic (not gated behind a flag - remove
+                    # once the reported "delta_psi always 0" question is
+                    # settled): the round-summary print only shows delta_psi
+                    # rounded to a few decimals, which can't distinguish a
+                    # genuinely-zero counterfactual from a small real
+                    # difference that rounds away. This prints both raw
+                    # accuracy values full-precision so that's answerable
+                    # directly from the next run's log instead of guessed at.
+                    print(
+                        f"    [delta_psi debug] {uav.uav_id}: baseline_acc="
+                        f"{baseline_acc:.6f} counterfactual_acc={counterfactual_acc:.6f} "
+                        f"(n_active_this_round={len(full_active)})"
+                    )
                 else:
                     delta_psi = 0.0
 
