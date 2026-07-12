@@ -1227,6 +1227,31 @@ class HFLRLStation(BaseStation):
         for uav in self.active_uavs:
             local_losses[uav.uav_id] = uav.train_local(self.config)
             uav.apply_poison(reference_weights)
+            # Temporary diagnostic (remove once the delta_psi=0 question is
+            # settled): delta_psi being mathematically EXACT zero for every
+            # decision, every round, is only possible if every active UAV's
+            # post-training state_dict() is identical to reference_weights -
+            # i.e. local training isn't changing any weights at all. This
+            # prints the local loss (already computed above) alongside the
+            # L2 norm of (post-training weights - reference weights) so
+            # that's directly checkable from the next run's log: local_loss
+            # near 0 AND weight_delta_norm near 0 -> train_local likely isn't
+            # doing anything (e.g. an empty/degenerate dataset shard, zero
+            # local_epochs); local_loss plausible (e.g. ~2.3 early on) but
+            # weight_delta_norm still ~0 -> something is reverting weights
+            # after training, a different bug entirely.
+            with torch.no_grad():
+                post_train = uav.state_dict()
+                delta_sq = sum(
+                    (post_train[k].float() - reference_weights[k].float()).pow(2).sum().item()
+                    for k in reference_weights
+                )
+            weight_delta_norm = delta_sq ** 0.5
+            print(
+                f"    [train_local debug] {uav.uav_id}: local_loss="
+                f"{local_losses[uav.uav_id]:.6f} weight_delta_norm={weight_delta_norm:.8f} "
+                f"n_samples={uav.num_samples}"
+            )
 
         self._run_contamination_detection(reference_weights)
         self._update_reputations(reference_weights)
