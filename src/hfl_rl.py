@@ -135,6 +135,28 @@ class RLConfig:
     ppo_epochs: int = 4
     hidden_dim: int = 64
 
+    # Delta_psi scale (Eq. 26: R = rho_t + Delta_psi + Lambda(a) - a straight,
+    # unweighted sum in the paper, no coefficient specified for any term).
+    # Confirmed deviation from the paper's literal equation, added after
+    # observing that Delta_psi's natural magnitude (mean ~0.05, max ~0.26 in
+    # practice - a leave-one-out accuracy shift is just inherently small) is
+    # ~10x smaller than rho_t's typical magnitude (~0.51) and ~170x smaller
+    # than a typical Quarantine/Exclude penalty (~8.25) - meaning Delta_psi
+    # essentially never has enough weight to influence which action wins,
+    # even when a removal genuinely hurt accuracy. Default 10.0 targets
+    # rho_t's scale specifically, not Lambda(a)'s: rho_t and Delta_psi are
+    # both intrinsic "was this a good outcome" signals (reputation
+    # trajectory and accuracy consequence), whereas Lambda(a) is a
+    # deliberately dominant administrative cost meant to override both when
+    # an action is expensive - Delta_psi doesn't need to compete with a
+    # large Lambda(a), it needs to matter when Lambda(a) is already small
+    # (a confidently-high-lambda UAV, where quarantine/exclude is cheap),
+    # which is exactly where "but did this actually help?" should still
+    # get a vote. This value was computed from one run's observed
+    # magnitudes, not derived from first principles - worth re-checking
+    # against future runs, not a settled constant.
+    delta_psi_scale: float = 10.0
+
     # Exclusion-unlock warm-up (implementation-level training-stability
     # guard; NOT part of the paper's Algorithm 1 / Eq. 23 specification).
     # EXCLUDE stays masked out of the PPO action space until at least this
@@ -1146,20 +1168,7 @@ class HFLRLStation(BaseStation):
                         self.validation_set,
                         self.config,
                     )
-                    delta_psi = counterfactual_acc - baseline_acc
-                    # Temporary diagnostic (not gated behind a flag - remove
-                    # once the reported "delta_psi always 0" question is
-                    # settled): the round-summary print only shows delta_psi
-                    # rounded to a few decimals, which can't distinguish a
-                    # genuinely-zero counterfactual from a small real
-                    # difference that rounds away. This prints both raw
-                    # accuracy values full-precision so that's answerable
-                    # directly from the next run's log instead of guessed at.
-                    print(
-                        f"    [delta_psi debug] {uav.uav_id}: baseline_acc="
-                        f"{baseline_acc:.6f} counterfactual_acc={counterfactual_acc:.6f} "
-                        f"(n_active_this_round={len(full_active)})"
-                    )
+                    delta_psi = (counterfactual_acc - baseline_acc) * self.rl_config.delta_psi_scale
                 else:
                     delta_psi = 0.0
 
@@ -1262,31 +1271,6 @@ class HFLRLStation(BaseStation):
         for uav in self.active_uavs:
             local_losses[uav.uav_id] = uav.train_local(self.config)
             uav.apply_poison(reference_weights)
-            # Temporary diagnostic (remove once the delta_psi=0 question is
-            # settled): delta_psi being mathematically EXACT zero for every
-            # decision, every round, is only possible if every active UAV's
-            # post-training state_dict() is identical to reference_weights -
-            # i.e. local training isn't changing any weights at all. This
-            # prints the local loss (already computed above) alongside the
-            # L2 norm of (post-training weights - reference weights) so
-            # that's directly checkable from the next run's log: local_loss
-            # near 0 AND weight_delta_norm near 0 -> train_local likely isn't
-            # doing anything (e.g. an empty/degenerate dataset shard, zero
-            # local_epochs); local_loss plausible (e.g. ~2.3 early on) but
-            # weight_delta_norm still ~0 -> something is reverting weights
-            # after training, a different bug entirely.
-            with torch.no_grad():
-                post_train = uav.state_dict()
-                delta_sq = sum(
-                    (post_train[k].float() - reference_weights[k].float()).pow(2).sum().item()
-                    for k in reference_weights
-                )
-            weight_delta_norm = delta_sq ** 0.5
-            print(
-                f"    [train_local debug] {uav.uav_id}: local_loss="
-                f"{local_losses[uav.uav_id]:.6f} weight_delta_norm={weight_delta_norm:.8f} "
-                f"n_samples={uav.num_samples}"
-            )
 
         self._run_contamination_detection(reference_weights)
         self._update_reputations(reference_weights)

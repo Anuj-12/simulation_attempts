@@ -153,6 +153,19 @@ def parse_args() -> argparse.Namespace:
         "flags, each defaults to 0.10 independently.",
     )
     parser.add_argument(
+        "--delta-psi-scale",
+        type=float,
+        default=None,
+        help="Multiplier applied to Delta_psi (the accuracy-consequence term in "
+        "Eq. 26) before it's summed into the reward. The paper's Eq. 26 is an "
+        "unweighted sum with no coefficient specified for any term; default 10.0 "
+        "here was computed from one run's observed magnitudes (Delta_psi's "
+        "natural scale is ~10x smaller than rho_t's and ~170x smaller than a "
+        "typical Quarantine/Exclude penalty, so it rarely had enough weight to "
+        "influence which action wins) - re-verify against your own runs rather "
+        "than treating 10.0 as settled.",
+    )
+    parser.add_argument(
         "--exclude-warmup-fraction",
         type=float,
         default=None,
@@ -250,6 +263,9 @@ def make_rl_config(args: argparse.Namespace) -> RLConfig:
     flag_reset = args.flag_reset_fraction if args.flag_reset_fraction is not None else args.primer_fraction
     if flag_reset is not None:
         default_kwargs["flag_reset_fraction"] = flag_reset
+
+    if args.delta_psi_scale is not None:
+        default_kwargs["delta_psi_scale"] = args.delta_psi_scale
 
     return RLConfig(
         reset_flags_after_primer=not args.no_flag_reset,
