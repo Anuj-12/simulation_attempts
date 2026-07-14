@@ -290,24 +290,59 @@ class RLEdgeUAV(EdgeUAV):
         )
 
     def update_reputation(self, eta: float, tau: float) -> float:
-        """Eq. 7 (energy terms normalized to keep rho in a stable range)."""
+        """Eq. 7 (energy terms normalized to keep rho in a stable range).
+
+        Defensive guards (not part of the paper): both phi and the final
+        clamp on self.reputation previously used Python's built-in max/min,
+        which do NOT reliably clamp NaN (e.g. max(nan, 1e-8) checks
+        `1e-8 < nan`, which is False, so it returns the unclamped nan) -
+        confirmed as a real, not just theoretical, problem by an actual run:
+        once the global model overflowed to NaN/Inf from compounding,
+        unclipped poisoned aggregation, model_contribution (computed from
+        GTG-Shapley accuracy evaluations on that corrupted model) went NaN,
+        passed through the old `max(self.model_contribution, 1e-8)`
+        unclamped, propagated through reward_term/penalty_term into
+        self.reputation, and then passed through the old
+        `max(min(self.reputation, 10.0), 0.0)` unclamped too - eventually
+        crashing assign_quarantine's int() conversion several calls later.
+        Fixing this at the source (every place self.reputation gets WRITTEN)
+        is more robust than guarding every downstream read individually.
+        """
         self.reputation_at_t = self.reputation  # rho_j^(t), used by reward Eq. 26
         lam = self.contamination_score
         q = self.flag_count
         e_res = self.residual_energy / 1000.0
         e_ret = max(self.retraining_energy, 0.0) / 100.0
-        phi = max(self.model_contribution, 1e-8)
+        phi = self.model_contribution if math.isfinite(self.model_contribution) else 1e-8
+        phi = max(phi, 1e-8)
 
         reward_term = (1.0 - lam) * (e_res / (1.0 + q)) * phi
         penalty_term = lam * (e_ret / phi) * math.exp(tau * q)
-        self.reputation = self.reputation + eta * (reward_term - penalty_term)
-        self.reputation = max(min(self.reputation, 10.0), 0.0)
+        new_reputation = self.reputation + eta * (reward_term - penalty_term)
+        if not math.isfinite(new_reputation):
+            new_reputation = self.reputation_at_t  # fall back to last known-good value
+        self.reputation = max(min(new_reputation, 10.0), 0.0)
         return self.reputation
 
     def assign_quarantine(self, tau: float) -> int:
-        """T_j^Q = exp(tau * q_j) / (1 + rho_j)  (Eq. 28)."""
+        """T_j^Q = exp(tau * q_j) / (1 + rho_j)  (Eq. 28).
+
+        Defensive guard (not part of the paper): sanitizes a non-finite
+        self.reputation before it reaches this formula. Confirmed as a real
+        crash site by an actual run: max(self.reputation, 0.0) does NOT
+        reliably clamp NaN (max(nan, 0.0) checks `0.0 < nan`, which is
+        False, so it returns the unclamped nan), so a NaN reputation
+        (propagated here from Eq. 7 once the global model itself overflows
+        to NaN/Inf from compounding, unclipped poisoned aggregation - see
+        RLConfig/changes-doc notes on poison_scale) reached
+        int(math.exp(...) / (1.0 + nan)) and crashed with "cannot convert
+        float NaN to integer". Falls back to initial_reputation's default
+        (0.5) on a non-finite read, same neutral fallback used in
+        observation().
+        """
         self.flag_count += 1
-        duration = int(math.exp(tau * self.flag_count) / (1.0 + max(self.reputation, 0.0)))
+        rho = self.reputation if math.isfinite(self.reputation) else 0.5
+        duration = int(math.exp(tau * self.flag_count) / (1.0 + max(rho, 0.0)))
         self.quarantine_rounds_remaining = max(duration, 0)
         self.participation = ParticipationState.QUARANTINED
         return self.quarantine_rounds_remaining
