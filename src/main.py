@@ -21,7 +21,10 @@ ReCon pipeline (ReCon.tex):
 from __future__ import annotations
 
 import argparse
-from typing import List, Sequence, Tuple
+import random
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import torch
 
 from flguardian_det import build_flguardian_hfl_adapter
 from fltrust import build_fltrust_hfl_adapter
@@ -65,7 +68,7 @@ DEFAULT_MALICIOUS: List[str] = [
 ]
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="ReCon: reputation-aware HFL with pluggable contamination detection "
         "(FLGuardian or FLTrust, per ReCon.tex's phi black-box interface)"
@@ -225,7 +228,21 @@ def parse_args() -> argparse.Namespace:
         default="cpu",
         help="Torch device (cpu or cuda)",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Global random seed (torch + Python random). Controls model "
+        "initialization, PPO action sampling, DataLoader shuffling, and "
+        "GTG-Shapley's permutation sampling. Does NOT affect the data "
+        "partition (hfl_common.partition_dataset) or FLTrust's root dataset "
+        "sample (fltrust.sample_root_dataset) - both already use their own "
+        "fixed seeds, independent of this one, so varying --seed compares "
+        "training/policy randomness on an identical data split rather than "
+        "conflating that with a different split each time. Default (unset) "
+        "is fully unseeded, same as before this flag existed.",
+    )
+    return parser.parse_args(argv)
 
 
 def make_hfl_config(args: argparse.Namespace) -> HFLConfig:
@@ -386,33 +403,33 @@ def _count_rollbacks(station, history: List[RoundSnapshot]) -> object:
     )
 
 
-def print_simulation_summary(
+def compute_simulation_summary(
     station,
     mode: str,
     coalitions: List[CoalitionSpec],
     malicious_uavs: Sequence[str],
     num_rounds: int,
-) -> None:
-    """Print a concise terminal-only execution summary (no file output)."""
+) -> Dict:
+    """Compute the same statistics print_simulation_summary prints, as a
+    plain dict instead of printed text - so a multi-seed runner (run_seeds.py)
+    can collect and aggregate these across runs without parsing printed
+    output."""
     history: List[RoundSnapshot] = getattr(station, "round_history", []) or []
     total_coalitions = len(coalitions)
     total_uavs = sum(len(members) for _, members in coalitions)
     malicious_set = set(malicious_uavs)
     total_malicious = len(malicious_set)
 
-    print("\n====================================")
-    print("Simulation Summary")
-    print("====================================")
-    print(f"Total rounds        : {num_rounds}")
-    print(f"Total coalitions     : {total_coalitions}")
-    print(f"Total UAVs           : {total_uavs}")
-    print(f"Total malicious UAVs : {total_malicious}")
-
+    base = {
+        "mode": mode,
+        "total_rounds": num_rounds,
+        "total_coalitions": total_coalitions,
+        "total_uavs": total_uavs,
+        "total_malicious": total_malicious,
+        "has_history": bool(history),
+    }
     if not history:
-        print("\nNo round history was recorded for this run (mode="
-              f"{mode!r}); RL/reputation/checkpoint stats are unavailable.")
-        print("====================================")
-        return
+        return base
 
     final = history[-1]
     final_uavs = final.uav_snapshots
@@ -448,45 +465,118 @@ def print_simulation_summary(
         1 for u in final_uavs if u.uav_id not in malicious_set and u.participation == "EXCLUDED"
     )
 
+    base.update({
+        "final_active": final.active_uavs,
+        "final_quarantined": final.quarantined_uavs,
+        "final_excluded": final.excluded_uavs,
+        "avg_accuracy": avg_accuracy,
+        "max_accuracy": max_accuracy,
+        "avg_reputation": avg_reputation,
+        "avg_contamination": avg_contamination,
+        "checkpoints_created": checkpoints_created,
+        "rollbacks": rollbacks,
+        "malicious_quarantined": mal_quarantined,
+        "malicious_excluded": mal_excluded,
+        "malicious_active": mal_active,
+        "benign_quarantined": ben_quarantined,
+        "benign_excluded": ben_excluded,
+    })
+    return base
+
+
+def print_simulation_summary(
+    station,
+    mode: str,
+    coalitions: List[CoalitionSpec],
+    malicious_uavs: Sequence[str],
+    num_rounds: int,
+) -> Dict:
+    """Print a concise terminal-only execution summary (no file output).
+    Returns the same dict compute_simulation_summary produces, in case the
+    caller wants it (main() ignores the return value; run_seeds.py uses
+    compute_simulation_summary directly instead, to run silently)."""
+    summary = compute_simulation_summary(station, mode, coalitions, malicious_uavs, num_rounds)
+
+    print("\n====================================")
+    print("Simulation Summary")
+    print("====================================")
+    print(f"Total rounds        : {summary['total_rounds']}")
+    print(f"Total coalitions     : {summary['total_coalitions']}")
+    print(f"Total UAVs           : {summary['total_uavs']}")
+    print(f"Total malicious UAVs : {summary['total_malicious']}")
+
+    if not summary["has_history"]:
+        print("\nNo round history was recorded for this run (mode="
+              f"{mode!r}); RL/reputation/checkpoint stats are unavailable.")
+        print("====================================")
+        return summary
+
     print("\nFinal counts:")
-    print(f"  Active      : {final.active_uavs}")
-    print(f"  Quarantined : {final.quarantined_uavs}")
-    print(f"  Excluded    : {final.excluded_uavs}")
+    print(f"  Active      : {summary['final_active']}")
+    print(f"  Quarantined : {summary['final_quarantined']}")
+    print(f"  Excluded    : {summary['final_excluded']}")
 
-    print(f"\nAverage global accuracy    : {avg_accuracy:.4f}")
-    print(f"Highest global accuracy    : {max_accuracy:.4f}")
-    print(f"Average reputation         : {avg_reputation:.4f}")
-    print(f"Average contamination score: {avg_contamination:.4f}")
+    print(f"\nAverage global accuracy    : {summary['avg_accuracy']:.4f}")
+    print(f"Highest global accuracy    : {summary['max_accuracy']:.4f}")
+    print(f"Average reputation         : {summary['avg_reputation']:.4f}")
+    print(f"Average contamination score: {summary['avg_contamination']:.4f}")
 
-    print(f"\nNumber of checkpoint rollbacks : {rollbacks}")
-    print(f"Number of checkpoints created  : {checkpoints_created}")
+    print(f"\nNumber of checkpoint rollbacks : {summary['rollbacks']}")
+    print(f"Number of checkpoints created  : {summary['checkpoints_created']}")
 
     print("\nMalicious UAV statistics:")
-    print(f"  Quarantined  : {mal_quarantined}")
-    print(f"  Excluded     : {mal_excluded}")
-    print(f"  Still active : {mal_active}")
+    print(f"  Quarantined  : {summary['malicious_quarantined']}")
+    print(f"  Excluded     : {summary['malicious_excluded']}")
+    print(f"  Still active : {summary['malicious_active']}")
 
     print("\nBenign UAV statistics:")
-    print(f"  Quarantined : {ben_quarantined}")
-    print(f"  Excluded    : {ben_excluded}")
+    print(f"  Quarantined : {summary['benign_quarantined']}")
+    print(f"  Excluded    : {summary['benign_excluded']}")
     print("====================================")
+    return summary
 
 
-def main() -> None:
-    args = parse_args()
+def apply_seed(seed: Optional[int]) -> None:
+    """Seed torch + Python's random module. See --seed's help text for what
+    this does and does not cover (notably: not partition_dataset's or
+    sample_root_dataset's own fixed internal seeds)."""
+    if seed is None:
+        return
+    torch.manual_seed(seed)
+    random.seed(seed)
+
+
+def run_simulation(args: argparse.Namespace, verbose: bool = True) -> Dict:
+    """Core simulation runner, extracted from main() so it's directly
+    reusable from run_seeds.py without CLI/subprocess plumbing. Returns the
+    same summary dict compute_simulation_summary produces (empty dict if
+    the run produced no station, e.g. an unrecognized mode - shouldn't
+    happen given argparse's choices= constraint, but kept defensive).
+
+    verbose=True (default, used by main()) prints the run banner and full
+    summary, exactly as before this function existed. verbose=False (used
+    by run_seeds.py for multi-seed runs) suppresses both, but NOT the
+    per-round training/governance logs emitted from within hfl_rl.py/
+    hfl_recovery.py themselves - those aren't gated by this flag, so a
+    multi-seed run will still be verbose per-round; only the banner/summary
+    printing here is suppressed.
+    """
+    apply_seed(args.seed)
     config = make_hfl_config(args)
     rl_config = make_rl_config(args)
     detector = make_contamination_detector(args, config)
     malicious = args.malicious if args.mode != "base" else []
 
-    print("=" * 72)
-    print("ReCon — Reputation-Aware Contamination Governance for UAV-HFL")
-    print("=" * 72)
-    print(f"Coalitions : {DEFAULT_COALITIONS}")
-    print(f"Detector   : {args.detector}")
-    print(f"Malicious  : {malicious or 'none'}")
-    print(f"Rounds     : {args.rounds}")
-    print("=" * 72)
+    if verbose:
+        print("=" * 72)
+        print("ReCon — Reputation-Aware Contamination Governance for UAV-HFL")
+        print("=" * 72)
+        print(f"Coalitions : {DEFAULT_COALITIONS}")
+        print(f"Detector   : {args.detector}")
+        print(f"Malicious  : {malicious or 'none'}")
+        print(f"Rounds     : {args.rounds}")
+        print(f"Seed       : {args.seed if args.seed is not None else 'unseeded'}")
+        print("=" * 72)
 
     station = None
     if args.mode == "base":
@@ -511,14 +601,21 @@ def main() -> None:
             recovery_config=recovery_config,
         )
 
-    if station is not None:
-        print_simulation_summary(
-            station,
-            args.mode,
-            DEFAULT_COALITIONS,
-            malicious,
-            args.rounds,
+    if station is None:
+        return {}
+
+    if verbose:
+        return print_simulation_summary(
+            station, args.mode, DEFAULT_COALITIONS, malicious, args.rounds,
         )
+    return compute_simulation_summary(
+        station, args.mode, DEFAULT_COALITIONS, malicious, args.rounds,
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    run_simulation(args, verbose=True)
 
 
 if __name__ == "__main__":
