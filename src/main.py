@@ -22,9 +22,24 @@ from __future__ import annotations
 
 import argparse
 import random
+import sys
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
+
+# Windows' console defaults to a legacy codepage (cp1252) that can't encode
+# the Greek-letter symbols (phi, lambda, rho, kappa, Delta, etc.) printed
+# throughout this codebase's logs - this crashes specifically when
+# redirecting stdout to a file (e.g. `python main.py > logs.txt`), since the
+# file handle inherits that same encoding. Forcing UTF-8 here fixes it
+# regardless of the user's terminal/locale settings, rather than relying on
+# them to set PYTHONIOENCODING or run `chcp 65001` every session.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
 
 from flguardian_det import build_flguardian_hfl_adapter
 from fltrust import build_fltrust_hfl_adapter
