@@ -338,6 +338,7 @@ def run_rl_mode(
     malicious_uavs: Sequence[str],
     poison_scale: float,
     rl_config: RLConfig | None = None,
+    warm_start_state_dict: Optional[dict] = None,
 ) -> HFLRLStation:
     print("Running HFL with PPO-based UAV state management + contamination detection (φ)")
     station = build_hfl_rl_system(
@@ -348,6 +349,9 @@ def run_rl_mode(
         malicious_uavs=malicious_uavs,
         poison_scale=poison_scale,
     )
+    if warm_start_state_dict is not None:
+        station.ppo.network.load_state_dict(warm_start_state_dict)
+        print("[Warm-start] Loaded policy network weights from a previous run.")
     _, test_set = load_fashion_mnist(config.data_dir)
     station.run(test_set)
     return station
@@ -361,6 +365,7 @@ def run_recovery_mode(
     poison_scale: float,
     rl_config: RLConfig | None = None,
     recovery_config: RecoveryConfig | None = None,
+    warm_start_state_dict: Optional[dict] = None,
 ):
     print("Running full ReCon: contamination detection (φ) + PPO governance + checkpoint recovery")
     station = build_hfl_recovery_system(
@@ -372,6 +377,9 @@ def run_recovery_mode(
         malicious_uavs=malicious_uavs,
         poison_scale=poison_scale,
     )
+    if warm_start_state_dict is not None:
+        station.ppo.network.load_state_dict(warm_start_state_dict)
+        print("[Warm-start] Loaded policy network weights from a previous run.")
     _, test_set = load_fashion_mnist(config.data_dir)
     station.run(test_set)
     return station
@@ -561,12 +569,26 @@ def apply_seed(seed: Optional[int]) -> None:
     random.seed(seed)
 
 
-def run_simulation(args: argparse.Namespace, verbose: bool = True) -> Dict:
+def run_simulation(
+    args: argparse.Namespace,
+    verbose: bool = True,
+    warm_start_state_dict: Optional[dict] = None,
+) -> Dict:
     """Core simulation runner, extracted from main() so it's directly
     reusable from run_seeds.py without CLI/subprocess plumbing. Returns the
     same summary dict compute_simulation_summary produces (empty dict if
     the run produced no station, e.g. an unrecognized mode - shouldn't
     happen given argparse's choices= constraint, but kept defensive).
+
+    warm_start_state_dict: if given (and mode is "rl" or "recovery"), loaded
+    into the PPO policy network BEFORE training starts, instead of the
+    network's normal random initialization. Everything else (UAV models,
+    reputation, participation state) still starts fresh regardless - only
+    the policy network itself carries forward. Ignored for mode="base"
+    (no PPO there). The returned dict always includes the just-trained
+    network's weights under "_ppo_state_dict" (None for mode="base"), so a
+    caller (run_seeds.py) can pass this run's result straight into the next
+    call's warm_start_state_dict to chain training across seeds.
 
     verbose=True (default, used by main()) prints the run banner and full
     summary, exactly as before this function existed. verbose=False (used
@@ -591,6 +613,8 @@ def run_simulation(args: argparse.Namespace, verbose: bool = True) -> Dict:
         print(f"Malicious  : {malicious or 'none'}")
         print(f"Rounds     : {args.rounds}")
         print(f"Seed       : {args.seed if args.seed is not None else 'unseeded'}")
+        if warm_start_state_dict is not None:
+            print("Warm-start : loaded policy weights from a previous run")
         print("=" * 72)
 
     station = None
@@ -599,7 +623,7 @@ def run_simulation(args: argparse.Namespace, verbose: bool = True) -> Dict:
     elif args.mode == "rl":
         station = run_rl_mode(
             config, DEFAULT_COALITIONS, detector, malicious, args.poison_scale,
-            rl_config=rl_config,
+            rl_config=rl_config, warm_start_state_dict=warm_start_state_dict,
         )
     else:
         recovery_config = RecoveryConfig(
@@ -614,18 +638,26 @@ def run_simulation(args: argparse.Namespace, verbose: bool = True) -> Dict:
             args.poison_scale,
             rl_config=rl_config,
             recovery_config=recovery_config,
+            warm_start_state_dict=warm_start_state_dict,
         )
 
     if station is None:
         return {}
 
     if verbose:
-        return print_simulation_summary(
+        summary = print_simulation_summary(
             station, args.mode, DEFAULT_COALITIONS, malicious, args.rounds,
         )
-    return compute_simulation_summary(
-        station, args.mode, DEFAULT_COALITIONS, malicious, args.rounds,
-    )
+    else:
+        summary = compute_simulation_summary(
+            station, args.mode, DEFAULT_COALITIONS, malicious, args.rounds,
+        )
+
+    # Attach the just-trained policy weights so a caller (run_seeds.py) can
+    # warm-start the next run from this one. None for mode="base" (no PPO).
+    ppo = getattr(station, "ppo", None)
+    summary["_ppo_state_dict"] = ppo.network.state_dict() if ppo is not None else None
+    return summary
 
 
 def main() -> None:

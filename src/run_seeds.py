@@ -75,6 +75,20 @@ def parse_seed_runner_args(argv: List[str] = None) -> Tuple[argparse.Namespace, 
         "logs from hfl_rl.py/hfl_recovery.py themselves - those print regardless, so a "
         "multi-seed run is still verbose per-round unless you redirect stdout.",
     )
+    parser.add_argument(
+        "--warm-start",
+        action="store_true",
+        help="Chain the PPO policy network's trained weights from each seed into the next "
+        "one, instead of every seed starting from a fresh random policy (the default). "
+        "UAV models, reputation, and participation state still reset fresh each seed "
+        "regardless - only the policy network itself carries forward. This changes what "
+        "--seeds measures: WITHOUT this flag, each run is an independent trial of the same "
+        "configuration (use this to check whether a result is stable/typical or a fluke - "
+        "the original purpose of this script). WITH this flag, seeds become sequential "
+        "training extensions of one continuously-improving policy (use this to keep "
+        "training a policy longer than one run, while still getting fresh random UAV/data "
+        "conditions each leg). Ignored for --mode base (no PPO there).",
+    )
     # parse_known_args so every other flag (--mode, --poison-scale, etc.)
     # passes through untouched to main.parse_args() for each seed.
     return parser.parse_known_args(argv)
@@ -82,13 +96,25 @@ def parse_seed_runner_args(argv: List[str] = None) -> Tuple[argparse.Namespace, 
 
 def run_all_seeds(runner_args: argparse.Namespace, remaining_argv: List[str]) -> List[Dict]:
     results: List[Dict] = []
+    warm_start_state_dict = None
     for seed in runner_args.seeds:
         argv = list(remaining_argv) + ["--seed", str(seed)]
         args = recon_main.parse_args(argv)
-        print(f"\n{'#' * 72}\n# Running seed={seed}\n{'#' * 72}")
-        summary = recon_main.run_simulation(args, verbose=not runner_args.quiet_runs)
+        print(f"\n{'#' * 72}\n# Running seed={seed}"
+              f"{' (warm-started from previous seed)' if warm_start_state_dict is not None else ''}"
+              f"\n{'#' * 72}")
+        summary = recon_main.run_simulation(
+            args,
+            verbose=not runner_args.quiet_runs,
+            warm_start_state_dict=warm_start_state_dict if runner_args.warm_start else None,
+        )
         summary["seed"] = seed
         results.append(summary)
+        if runner_args.warm_start:
+            warm_start_state_dict = summary.get("_ppo_state_dict")
+            if warm_start_state_dict is None:
+                print(f"[Warm-start] seed={seed} produced no PPO network (mode=base?) - "
+                      "next seed will start fresh instead of warm-started.")
     return results
 
 
