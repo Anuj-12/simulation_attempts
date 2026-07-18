@@ -1,1 +1,1 @@
-python run_seeds.py --seeds 1 2 3 --mode recovery --poison-scale 10 --delta-psi-scale 10 --rounds 50 --quiet-runs > seeds.txt
+python run_seeds.py --seeds 1 2 3 --warm-start --mode recovery --poison-scale 10 --delta-psi-scale 10 --rounds 50 --quiet-runs
