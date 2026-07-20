@@ -184,6 +184,25 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "than treating 10.0 as settled.",
     )
     parser.add_argument(
+        "--participation-bonus-rate",
+        type=float,
+        default=None,
+        help="Per-round bonus added to ALLOW's reward for each consecutive round "
+        "a UAV has stayed active (default 0.05). NOT in the paper - added because "
+        "nothing in Eq. 26-27 directly rewards continued participation; Delta_psi "
+        "only fires on Quarantine/Exclude, never Allow. Default rate*cap=1.0 "
+        "matches -lambda's max magnitude by construction. Set to 0 to disable.",
+    )
+    parser.add_argument(
+        "--participation-bonus-cap",
+        type=int,
+        default=None,
+        help="Max consecutive active rounds counted toward the participation bonus "
+        "(default 20, i.e. bonus caps at rate*20). Resets to 0 on any real "
+        "Quarantine/Exclude (not on a shadow-exclude, which never really removed "
+        "the UAV).",
+    )
+    parser.add_argument(
         "--exclude-warmup-fraction",
         type=float,
         default=None,
@@ -298,6 +317,11 @@ def make_rl_config(args: argparse.Namespace) -> RLConfig:
 
     if args.delta_psi_scale is not None:
         default_kwargs["delta_psi_scale"] = args.delta_psi_scale
+
+    if args.participation_bonus_rate is not None:
+        default_kwargs["participation_bonus_rate"] = args.participation_bonus_rate
+    if args.participation_bonus_cap is not None:
+        default_kwargs["participation_bonus_cap"] = args.participation_bonus_cap
 
     return RLConfig(
         reset_flags_after_primer=not args.no_flag_reset,

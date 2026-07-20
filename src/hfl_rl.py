@@ -157,6 +157,12 @@ class RLConfig:
     # against future runs, not a settled constant.
     delta_psi_scale: float = 10.0
 
+    # Participation bonus for Allow (see compute_reward's docstring for full
+    # rationale). rate * cap = max possible bonus magnitude; default 0.05*20
+    # = 1.0 matches -lambda's max magnitude (1.0) by construction.
+    participation_bonus_rate: float = 0.05
+    participation_bonus_cap: int = 20
+
     # Exclusion-unlock warm-up (implementation-level training-stability
     # guard; NOT part of the paper's Algorithm 1 / Eq. 23 specification).
     # EXCLUDE stays masked out of the PPO action space until at least this
@@ -260,6 +266,10 @@ class RLEdgeUAV(EdgeUAV):
     model_contribution: float = 1.0
     is_malicious: bool = False
     poison_scale: float = 50.0
+    # Consecutive rounds this UAV has been ACTIVE via ALLOW, uninterrupted
+    # by QUARANTINE/EXCLUDE. Drives the participation bonus in compute_reward
+    # (not part of the paper). Reset to 0 on QUARANTINE/EXCLUDE.
+    consecutive_active_rounds: int = 0
 
     @property
     def is_active(self) -> bool:
@@ -862,6 +872,7 @@ def compute_reward(
     action: UAVAction,
     quarantine_duration: int,
     tau: float,
+    participation_bonus_rate: float = 0.0,
 ) -> RewardBreakdown:
     """R_j^(t+1) = rho_j^(t) + Delta psi_j^(t) + Lambda(a)  (Eq. 26-27).
 
@@ -911,12 +922,24 @@ def compute_reward(
     exclude_unlocked does by default, meaning every UAV has q=0 right when
     Exclude becomes real for the first time - precisely where the unfixed
     version provided zero protection. Using q+1 consistently also gives this
-    a sensible "escalation" property: a first-time flag (q=0->1) now costs
-    MORE to Exclude than to Quarantine, i.e. try the reversible action before
-    the irreversible one, rather than either being systematically favored.
+    Participation bonus (added to directly counteract persistent over-exclusion
+    observed even after the e^(tau*q) fix and Delta_psi scaling - see changes
+    doc). NOT part of the paper. Nothing in Eq. 26-27 rewards a UAV for simply
+    continuing to participate - Delta_psi's leave-one-out signal is weak (see
+    delta_psi_scale) and only fires on Quarantine/Exclude decisions, never on
+    Allow, so there was no direct incentive for "keep this UAV around" beyond
+    the passive absence of a penalty. This adds one: Allow's reward now grows
+    with uav.consecutive_active_rounds (tenure), capped so it can't grow
+    unbounded. Default rate*cap = 1.0, matching -lambda's max magnitude (1.0)
+    by construction - a long-tenured, low-lambda UAV's bonus can fully offset
+    lambda's penalty, but never dominate it for a genuinely high-lambda UAV
+    (lambda's own -1 floor still applies on top). tau is otherwise unused in
+    the ALLOW branch; kept as a parameter for signature consistency with the
+    other two branches, not used here.
     """
     if action == UAVAction.ALLOW:
-        penalty = -uav.contamination_score
+        bonus = participation_bonus_rate * uav.consecutive_active_rounds
+        penalty = -uav.contamination_score + bonus
     elif action == UAVAction.QUARANTINE:
         lam = uav.contamination_score
         penalty = -(1.0 - lam) * float(quarantine_duration)
@@ -1145,16 +1168,25 @@ class HFLRLStation(BaseStation):
                 # the primer period carries zero real exclusion risk.
                 if action == UAVAction.QUARANTINE:
                     quarantine_assigned = uav.assign_quarantine(self.rl_config.penalty_tuning)
+                    uav.consecutive_active_rounds = 0
                 elif action == UAVAction.EXCLUDE:
                     if self.ppo.exclude_unlocked:
                         uav.exclude()
+                        uav.consecutive_active_rounds = 0
                     elif self.rl_config.shadow_exclude_during_primer:
                         shadow_excluded = True
                         self.shadow_excluded_this_round.add(uav.uav_id)
+                        # Shadow exclude never actually removed the UAV, so
+                        # its real tenure streak is not broken.
                     # else: unreachable when shadow_exclude_during_primer is
                     # False, since select_action was called with
                     # allow_exclude=False in that branch above, masking
                     # EXCLUDE out of the sampled distribution entirely.
+                else:  # ALLOW
+                    uav.consecutive_active_rounds = min(
+                        uav.consecutive_active_rounds + 1,
+                        self.rl_config.participation_bonus_cap,
+                    )
 
                 self.round_actions[uav.uav_id] = action
 
@@ -1173,7 +1205,8 @@ class HFLRLStation(BaseStation):
                     delta_psi = 0.0
 
                 reward = compute_reward(
-                    uav, delta_psi, action, quarantine_assigned, self.rl_config.penalty_tuning
+                    uav, delta_psi, action, quarantine_assigned, self.rl_config.penalty_tuning,
+                    self.rl_config.participation_bonus_rate,
                 )
                 meta[uav.uav_id] = {
                     "reward": reward.total,
