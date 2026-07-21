@@ -2,7 +2,7 @@
 PPO-based UAV state management for ReCon HFL (Sec. 4.2, Algorithm 1).
 
 Builds on hfl_base.py and implements:
-  - Observation o_j = (lambda_j, q_j, rho_j)           (Eq. 20)
+  - Observation o_j = (lambda_j, q_j, rho_j, tenure_j)  (Eq. 20, extended - see RLEdgeUAV.observation)
   - Action space {Allow, Quarantine, Exclude}        (Eq. 23), a_j ~ pi_theta
   - Reputation update                                 (Eq. 7)
   - Quarantine duration T_j^Q                         (Eq. 28)
@@ -286,7 +286,22 @@ class RLEdgeUAV(EdgeUAV):
                 param.data.copy_(ref + delta * self.poison_scale)
 
     def observation(self) -> torch.Tensor:
-        """o_j = (lambda_j, q_j, rho_j)  (Eq. 20).
+        """o_j = (lambda_j, q_j, rho_j, tenure_j)  (Eq. 20, extended).
+
+        FIX: tenure (consecutive_active_rounds) added as a 4th dimension.
+        The participation bonus (compute_reward) was shaping the reward
+        based on tenure, but tenure was NOT part of what the policy could
+        observe - meaning the network saw identical (lambda, q, rho) inputs
+        get inconsistent rewards depending on a hidden variable it had no
+        access to. That's pure noise to a policy gradient method, not
+        learnable signal: it cannot learn "keep long-tenured UAVs around" as
+        a decision rule if it cannot tell which UAV is long-tenured.
+        Confirmed as the likely cause after the participation bonus alone
+        (reward-only, no observation change) produced no improvement in
+        practice (max active UAVs unchanged). Normalized by a fixed 20.0,
+        matching RLConfig.participation_bonus_cap's default - an
+        approximation if that cap is overridden via CLI, since this method
+        doesn't have access to RLConfig to look up the actual value.
 
         Defensive guard (not part of the paper): sanitizes non-finite
         (NaN/+-Inf) values before they can reach the PPO network. This can
@@ -317,6 +332,7 @@ class RLEdgeUAV(EdgeUAV):
                 lam,
                 float(self.flag_count) / 5.0,
                 rho / 10.0,
+                float(self.consecutive_active_rounds) / 20.0,
             ],
             dtype=torch.float32,
         )
@@ -470,7 +486,7 @@ class RLFogUAV(FogUAV):
 class ActorCritic(nn.Module):
     """Shared actor-critic network for PPO."""
 
-    def __init__(self, obs_dim: int = 3, action_dim: int = 3, hidden_dim: int = 64) -> None:
+    def __init__(self, obs_dim: int = 4, action_dim: int = 3, hidden_dim: int = 64) -> None:
         super().__init__()
         self.shared = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim),
